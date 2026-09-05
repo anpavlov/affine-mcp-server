@@ -29,11 +29,11 @@ function cancelResponseBody(response: ResponseLike): void {
   }
 }
 
-export async function readLimitedResponseBody(
+export async function readLimitedResponseBytes(
   response: ResponseLike,
   maxResponseBytes: number,
   label: string,
-): Promise<string> {
+): Promise<Uint8Array> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     const declaredLength = Number(contentLength);
@@ -46,7 +46,7 @@ export async function readLimitedResponseBody(
   }
 
   if (!response.body) {
-    return "";
+    return new Uint8Array();
   }
 
   const chunks: Buffer[] = [];
@@ -62,22 +62,30 @@ export async function readLimitedResponseBody(
     }
     chunks.push(buffer);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return new Uint8Array(Buffer.concat(chunks));
 }
 
-export async function fetchResponseBody<T extends ResponseLike>(
+export async function readLimitedResponseBody(
+  response: ResponseLike,
+  maxResponseBytes: number,
+  label: string,
+): Promise<string> {
+  return Buffer.from(await readLimitedResponseBytes(response, maxResponseBytes, label)).toString("utf8");
+}
+
+export async function fetchResponseBytes<T extends ResponseLike>(
   request: (signal: AbortSignal) => Promise<T>,
   {
     label,
     maxResponseBytes = MAX_HTTP_RESPONSE_BYTES,
     timeoutMs,
   }: FetchResponseBodyOptions,
-): Promise<{ response: T; body: string }> {
+): Promise<{ response: T; body: Uint8Array }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await request(controller.signal);
-    const body = await readLimitedResponseBody(response, maxResponseBytes, `${label} response`);
+    const body = await readLimitedResponseBytes(response, maxResponseBytes, `${label} response`);
     return { response, body };
   } catch (error) {
     if (controller.signal.aborted) {
@@ -88,4 +96,12 @@ export async function fetchResponseBody<T extends ResponseLike>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function fetchResponseBody<T extends ResponseLike>(
+  request: (signal: AbortSignal) => Promise<T>,
+  options: FetchResponseBodyOptions,
+): Promise<{ response: T; body: string }> {
+  const { response, body } = await fetchResponseBytes(request, options);
+  return { response, body: Buffer.from(body).toString("utf8") };
 }

@@ -198,9 +198,9 @@ async function buildServer() {
   console.error(`[affine-mcp] Enabled tools: ${toolFilter.enabledTools.length}/${toolFilter.totalToolCount}`);
 
   registerWorkspaceTools(server, gql);
-  registerDocTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  const { projectReadDoc } = registerDocTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   registerCommentTools(server, gql, { workspaceId: config.defaultWorkspaceId });
-  registerHistoryTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  registerHistoryTools(server, gql, { workspaceId: config.defaultWorkspaceId }, projectReadDoc);
   registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   registerPropertyTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   registerIconTools(server, gql, { workspaceId: config.defaultWorkspaceId });

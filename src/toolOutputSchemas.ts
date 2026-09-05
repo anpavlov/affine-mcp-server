@@ -49,6 +49,7 @@ const OUTPUT_SPECS = {
   append_block: receipt({ workspaceId: "nullableString", docId: "string", appended: "boolean", blockId: "string", flavour: "string", type: "nullableString", blockType: "nullableString", normalizedType: "string", legacyType: "nullableString" }),
   append_markdown: receipt({ workspaceId: "string", docId: "string", appended: "boolean", appendedCount: "number", blockIds: "stringArray", warnings: "stringArray", lossy: "boolean", stats: "object" }),
   append_semantic_section: spec({ workspaceId: "string", docId: "string", noteId: "string", sectionTitle: "string", sectionHeadingId: "string", afterSectionTitle: "nullableString", blockIds: "stringArray", appendedCount: "number" }),
+  apply_doc_patch: fallible(receipt({ patchId: "string", workspaceId: "string", docId: "string", status: "string" }, true)),
   cleanup_blobs: fallible(receipt({ status: "string", success: "boolean", workspaceId: "string", blobsReleased: "boolean" }, true)),
   clear_doc_property: spec({ workspaceId: "string", docId: "string", propertyId: "string", cleared: "boolean" }),
   compose_database_from_intent: spec({ workspaceId: "string", docId: "string", intent: "string", title: "string", databaseBlockId: "string", primaryViewId: "nullableString", viewIds: "stringArray", columnIds: "stringArray", rowBlockIds: "stringArray", columns: "unknownArray", views: "unknownArray", warnings: "stringArray", lossy: "boolean", stats: "object" }),
@@ -75,6 +76,8 @@ const OUTPUT_SPECS = {
   delete_surface_element: spec({ deleted: "boolean", elementId: "string", reason: "string", prunedConnectors: "stringArray" }, true),
   delete_tag: spec({ workspaceId: "string", tag: "string", tagId: "string", value: "string", deleted: "boolean", affectedDocs: "number", docMetaSynced: "number", warnings: "stringArray" }),
   delete_workspace: fallible(spec({ kind: "string", ok: "boolean", workspaceId: "string", id: "string", deleted: "boolean", success: "boolean", message: "string", error: "string" }, true)),
+  diff_doc_revision: fallible(spec({ workspaceId: "string", docId: "string", fromTimestamp: "string", toTimestamp: "nullableString", to: "string", diff: "object" }, true)),
+  discard_doc_patch: fallible(receipt({ patchId: "string", workspaceId: "string", docId: "string", status: "string", reason: "string" }, true)),
   export_doc_markdown: spec({ docId: "string", title: "nullableString", tags: "stringArray", exists: "boolean", markdown: "string", warnings: "stringArray", lossy: "boolean", stats: "object" }),
   export_with_fidelity_report: spec({ docId: "string", exists: "boolean", markdown: "string", fidelity: "object" }),
   find_doc_by_title: spec({ query: "string", caseInsensitive: "boolean", matches: "unknownArray", workspaceDocCount: "number", truncated: "boolean" }),
@@ -105,10 +108,12 @@ const OUTPUT_SPECS = {
   move_doc: fallible(receipt({ workspaceId: "string", moved: "boolean", docId: "string", toParentDocId: "string", removedFromParent: "boolean" })),
   move_organize_node: spec({ id: "string", parentId: "nullableString", index: "string" }),
   publish_doc: receipt({ workspaceId: "string", docId: "string" }),
+  prepare_doc_patch: fallible(spec({ patchId: "string", workspaceId: "string", docId: "string", status: "string", summary: "string", diff: "object", expiresAt: "string" }, true)),
   read_all_notifications: fallible(spec({ success: "boolean", message: "string", error: "string" }, true)),
   read_database_cells: spec({ rows: "unknownArray" }),
   read_database_columns: spec({ databaseBlockId: "string", title: "nullableString", rowCount: "number", columnCount: "number", titleColumnId: "nullableString", columns: "unknownArray", views: "unknownArray" }),
   read_doc: spec({ docId: "string", title: "nullableString", tags: "stringArray", exists: "boolean", blockCount: "number", blocks: "unknownArray", plainText: "string", markdown: "string" }, true),
+  read_doc_revision: fallible(spec({ docId: "string", title: "nullableString", tags: "stringArray", exists: "boolean", blockCount: "number", blocks: "unknownArray", plainText: "string", markdown: "string" }, true)),
   remove_doc_from_collection: spec({ id: "string", name: "string", rules: "object", allowList: "stringArray" }),
   remove_tag_from_doc: spec({ workspaceId: "string", docId: "string", tag: "string", removed: "boolean", tags: "stringArray", docMetaSynced: "boolean", warning: "nullableString" }),
   rename_folder: spec({ id: "string", name: "string" }),
@@ -145,6 +150,45 @@ export const TOOLS_WITH_ERROR_OUTPUT = Object.freeze(
     .map(([name]) => name as ToolName),
 );
 
+const strictErrorFields = {
+  error: z.string().optional(),
+  code: z.string().optional(),
+  retryable: z.boolean().optional(),
+  details: z.record(z.string(), z.unknown()).optional(),
+  operation: z.string().optional(),
+};
+
+const STRICT_OUTPUT_SCHEMAS: Partial<Record<ToolName, ZodTypeAny>> = {
+  prepare_doc_patch: z.object({
+    patchId: z.string().optional(), workspaceId: z.string().optional(), docId: z.string().optional(),
+    status: z.literal("prepared").optional(), summary: z.string().optional(),
+    diff: z.record(z.string(), z.unknown()).optional(), expiresAt: z.string().optional(),
+    ok: z.boolean().optional(), ...strictErrorFields,
+  }).strict(),
+  apply_doc_patch: z.object({
+    kind: z.literal("doc.patch.apply").optional(), ok: z.boolean().optional(), patchId: z.string().optional(),
+    workspaceId: z.string().optional(), docId: z.string().optional(), status: z.literal("consumed").optional(),
+    ...strictErrorFields,
+  }).strict(),
+  discard_doc_patch: z.object({
+    kind: z.literal("doc.patch.discard").optional(), ok: z.boolean().optional(), patchId: z.string().optional(),
+    workspaceId: z.string().optional(), docId: z.string().optional(),
+    status: z.enum(["prepared", "applying", "consumed", "discarded", "unknown", "expired", "not_found"]).optional(),
+    reason: z.enum(["user", "stale"]).optional(), ...strictErrorFields,
+  }).strict(),
+  read_doc_revision: z.object({
+    docId: z.string().optional(), title: z.string().nullable().optional(), tags: z.array(z.string()).optional(),
+    exists: z.boolean().optional(), blockCount: z.number().optional(), blocks: z.array(z.unknown()).optional(),
+    plainText: z.string().optional(), markdown: z.string().optional(), ok: z.boolean().optional(),
+    ...strictErrorFields,
+  }).strict(),
+  diff_doc_revision: z.object({
+    workspaceId: z.string().optional(), docId: z.string().optional(), fromTimestamp: z.string().optional(),
+    toTimestamp: z.string().nullable().optional(), to: z.enum(["revision", "current"]).optional(),
+    diff: z.record(z.string(), z.unknown()).optional(), ok: z.boolean().optional(), ...strictErrorFields,
+  }).strict(),
+};
+
 /** Converts a compact field kind into its runtime Zod schema. */
 function fieldSchema(kind: FieldKind): ZodTypeAny {
   switch (kind) {
@@ -174,6 +218,8 @@ function fieldSchema(kind: FieldKind): ZodTypeAny {
 
 /** Returns the declared structured-result schema for a canonical MCP tool. */
 export function toolOutputSchemaFor(name: string): ZodTypeAny | undefined {
+  const strictSchema = STRICT_OUTPUT_SCHEMAS[name as ToolName];
+  if (strictSchema) return strictSchema;
   const outputSpec = OUTPUT_SPECS[name as ToolName];
   if (!outputSpec) return undefined;
 

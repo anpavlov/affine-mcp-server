@@ -41,6 +41,7 @@ import { richTextValueToDeltas, richTextValueToString } from "../markdown/richTe
 import { buildMarkdownFrontmatter } from "../markdown/safety.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
 import { addOrganizeLinkToFolder } from "./organize.js";
+import { createDocPatchManager, DocPatchError } from "../docPatches.js";
 import {
   type Bound,
   DEFAULT_NOTE_XYWH,
@@ -342,6 +343,54 @@ const TextDeltaInput = z.object({
   attributes: z.record(z.unknown()).optional(),
 });
 const RichTextInput = z.union([z.string(), z.array(TextDeltaInput)]);
+const PatchId = z.string().regex(/^dp_[0-9a-f]{32}$/);
+const PatchBlockId = z.string().trim().min(1);
+const PatchRichText = z.union([z.string(), z.array(TextDeltaInput.strict())]);
+const InsertBlockSpec = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("paragraph"), text: PatchRichText.optional() }).strict(),
+  z.object({ type: z.literal("quote"), text: PatchRichText.optional() }).strict(),
+  z.object({
+    type: z.literal("heading"), text: PatchRichText.optional(),
+    level: z.number().int().min(1).max(6).optional(),
+  }).strict(),
+  z.object({
+    type: z.literal("list"), text: PatchRichText.optional(),
+    style: z.enum(["bulleted", "numbered", "todo"]).optional(),
+    checked: z.boolean().optional(),
+  }).strict(),
+  z.object({
+    type: z.literal("code"), text: PatchRichText.optional(),
+    language: z.string().max(64).optional(),
+  }).strict(),
+]).superRefine((block, context) => {
+  if (block.type === "list" && block.checked !== undefined && block.style !== "todo") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["checked"],
+      message: "checked requires style=todo",
+    });
+  }
+});
+const InsertPlacement = z.union([
+  z.object({ afterBlockId: PatchBlockId }).strict(),
+  z.object({ beforeBlockId: PatchBlockId }).strict(),
+]);
+export const PatchOperationSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("replace_block_text"), blockId: PatchBlockId, text: PatchRichText }).strict(),
+  z.object({
+    type: z.literal("insert_block"), parentId: PatchBlockId, block: InsertBlockSpec,
+    placement: InsertPlacement.optional(),
+  }).strict(),
+  z.object({ type: z.literal("delete_block_subtree"), blockId: PatchBlockId }).strict(),
+]);
+export type PatchOperation = z.infer<typeof PatchOperationSchema>;
+export const PrepareDocPatchInput = z.object({
+  workspaceId: WorkspaceId.optional(),
+  docId: DocId,
+  operations: z.array(PatchOperationSchema).min(1).max(100),
+}).strict();
+export const ApplyDocPatchInput = z.object({ patchId: PatchId }).strict();
+export const DiscardDocPatchInput = ApplyDocPatchInput;
 const MarkdownContent = z.string().min(1, "markdown required").describe("Markdown content to import, append, replace, or export-roundtrip.");
 const TagName = z.string().trim().min(1, "tag required").describe("Workspace tag name.");
 const TagIdOrName = z.string().trim().min(1, "tag required").describe("Workspace tag id or tag name.");
@@ -3002,6 +3051,27 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
+  function insertBlockIntoDoc(doc: Y.Doc, normalized: NormalizedAppendBlockInput) {
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+    const context = resolveInsertContext(blocks, normalized);
+    const created = createBlock(normalized);
+    blocks.set(created.blockId, created.block);
+    for (const extra of created.extraBlocks ?? []) blocks.set(extra.blockId, extra.block);
+    if (context.insertIndex >= context.children.length) context.children.push([created.blockId]);
+    else context.children.insert(context.insertIndex, [created.blockId]);
+    return created;
+  }
+
+  function replaceBlockText(block: Y.Map<any>, content: string | TextDelta[]): boolean {
+    const rawText = block.get("prop:text");
+    const matches = typeof content === "string"
+      ? asText(rawText) === content
+      : isDeepStrictEqual(richTextValueToDeltas(rawText) ?? [], canonicalTextDeltas(content));
+    if (matches) return false;
+    block.set("prop:text", makeText(content));
+    return true;
+  }
+
   async function appendBlockInternal(parsed: AppendBlockInput) {
     const normalized = normalizeAppendBlockInput(parsed);
     const workspaceId = normalized.workspaceId || defaults.workspaceId;
@@ -3025,20 +3095,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const prevSV = Y.encodeStateVector(doc);
       const blocks = doc.getMap("blocks") as Y.Map<any>;
       resolveEdgelessLayoutHints(blocks, normalized);
-      const context = resolveInsertContext(blocks, normalized);
-      const { blockId, block, flavour, blockType, extraBlocks } = createBlock(normalized);
-
-      blocks.set(blockId, block);
-      if (Array.isArray(extraBlocks)) {
-        for (const extra of extraBlocks) {
-          blocks.set(extra.blockId, extra.block);
-        }
-      }
-      if (context.insertIndex >= context.children.length) {
-        context.children.push([blockId]);
-      } else {
-        context.children.insert(context.insertIndex, [blockId]);
-      }
+      const { blockId, flavour, blockType } = insertBlockIntoDoc(doc, normalized);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
       await pushDocUpdate(socket, workspaceId, normalized.docId, Buffer.from(delta).toString("base64"));
@@ -5555,6 +5612,86 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     getDocHandler as any
   );
 
+  function projectReadDoc(
+    doc: Y.Doc,
+    docId: string,
+    options: { includeMarkdown?: boolean; tagOptionsById?: Map<string, WorkspaceTagOption> } = {},
+  ): Record<string, unknown> {
+    const meta = doc.getMap("meta");
+    const tags = resolveTagLabels(getStringArray(getTagArray(meta)), options.tagOptionsById ?? new Map());
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+    const pageId = findBlockIdByFlavour(blocks, "affine:page");
+    const noteId = findBlockIdByFlavour(blocks, "affine:note");
+    const visited = new Set<string>();
+    const blockRows: Array<{
+      id: string;
+      parentId: string | null;
+      flavour: string | null;
+      type: string | null;
+      text: string | null;
+      deltas: TextDelta[];
+      tableData?: string[][];
+      tableCellDeltas?: TextDelta[][][];
+      linkedDocIds: string[];
+      checked: boolean | null;
+      language: string | null;
+      childIds: string[];
+    }> = [];
+    const plainTextLines: string[] = [];
+    let title = "";
+
+    const visit = (blockId: string) => {
+      if (visited.has(blockId)) return;
+      visited.add(blockId);
+      const raw = blocks.get(blockId);
+      if (!(raw instanceof Y.Map)) return;
+      const flavour = raw.get("sys:flavour");
+      const propText = raw.get("prop:text");
+      const textValue = asText(propText);
+      const table = flavour === "affine:table" ? extractTableData(raw) : null;
+      const childIds = childIdsFrom(raw.get("sys:children"));
+      if (flavour === "affine:page") title = asText(raw.get("prop:title")) || title;
+      if (textValue.length > 0) plainTextLines.push(textValue);
+      blockRows.push({
+        id: blockId,
+        parentId: resolveBlockParentId(blocks, blockId),
+        flavour: typeof flavour === "string" ? flavour : null,
+        type: typeof raw.get("prop:type") === "string" ? raw.get("prop:type") : null,
+        text: textValue.length > 0 ? textValue : null,
+        deltas: richTextValueToDeltas(propText) ?? [],
+        ...(table ? { tableData: table.tableData, tableCellDeltas: table.tableCellDeltas } : {}),
+        linkedDocIds: extractLinkedPageRefs(propText),
+        checked: typeof raw.get("prop:checked") === "boolean" ? raw.get("prop:checked") : null,
+        language: typeof raw.get("prop:language") === "string" ? raw.get("prop:language") : null,
+        childIds,
+      });
+      for (const childId of childIds) visit(childId);
+    };
+
+    if (pageId) visit(pageId);
+    else if (noteId) visit(noteId);
+    for (const [id] of blocks) visit(String(id));
+
+    let markdown: string | undefined;
+    if (options.includeMarkdown) {
+      const collected = collectDocForMarkdown(doc, new Map());
+      markdown = renderBlocksToMarkdown({
+        rootBlockIds: collected.rootBlockIds,
+        blocksById: collected.blocksById,
+      }).markdown;
+    }
+    return {
+      docId,
+      title: title || null,
+      tags,
+      exists: true,
+      blockCount: blockRows.length,
+      blocks: blockRows,
+      plainText: plainTextLines.join("\n"),
+      ...(markdown !== undefined ? { markdown } : {}),
+    };
+  }
+
   const readDocHandler = async (parsed: { workspaceId?: string; docId: string; includeMarkdown?: boolean }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
@@ -5570,8 +5707,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const workspaceSnapshot = await loadDoc(socket, workspaceId, workspaceId);
       if (workspaceSnapshot.missing) {
         const workspaceDoc = new Y.Doc();
-        Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
-        tagOptionsById = getWorkspaceTagOptionMaps(workspaceDoc.getMap("meta")).byId;
+        try {
+          Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
+          tagOptionsById = getWorkspaceTagOptionMaps(workspaceDoc.getMap("meta")).byId;
+        } finally {
+          workspaceDoc.destroy();
+        }
       }
 
       const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
@@ -5589,112 +5730,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const doc = new Y.Doc();
-      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-
-      const meta = doc.getMap("meta");
-      const tags = resolveTagLabels(getStringArray(getTagArray(meta)), tagOptionsById);
-      const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const pageId = findBlockIdByFlavour(blocks, "affine:page");
-      const noteId = findBlockIdByFlavour(blocks, "affine:note");
-      const visited = new Set<string>();
-      const blockRows: Array<{
-        id: string;
-        parentId: string | null;
-        flavour: string | null;
-        type: string | null;
-        text: string | null;
-        deltas: TextDelta[];
-        tableData?: string[][];
-        tableCellDeltas?: TextDelta[][][];
-        linkedDocIds: string[];
-        checked: boolean | null;
-        language: string | null;
-        childIds: string[];
-      }> = [];
-      const plainTextLines: string[] = [];
-      let title = "";
-
-      const visit = (blockId: string) => {
-        if (visited.has(blockId)) return;
-        visited.add(blockId);
-
-        const raw = blocks.get(blockId);
-        if (!(raw instanceof Y.Map)) return;
-
-        const flavour = raw.get("sys:flavour");
-        const parentId = resolveBlockParentId(blocks, blockId);
-        const type = raw.get("prop:type");
-        const propText = raw.get("prop:text");
-        const textValue = asText(propText);
-        const deltas = richTextValueToDeltas(propText) ?? [];
-        const table = flavour === "affine:table" ? extractTableData(raw) : null;
-        const linkedDocIds = extractLinkedPageRefs(propText);
-        const language = raw.get("prop:language");
-        const checked = raw.get("prop:checked");
-        const childIds = childIdsFrom(raw.get("sys:children"));
-
-        if (flavour === "affine:page") {
-          title = asText(raw.get("prop:title")) || title;
-        }
-        if (textValue.length > 0) {
-          plainTextLines.push(textValue);
-        }
-
-        blockRows.push({
-          id: blockId,
-          parentId,
-          flavour: typeof flavour === "string" ? flavour : null,
-          type: typeof type === "string" ? type : null,
-          text: textValue.length > 0 ? textValue : null,
-          deltas,
-          ...(table ? {
-            tableData: table.tableData,
-            tableCellDeltas: table.tableCellDeltas,
-          } : {}),
-          linkedDocIds,
-          checked: typeof checked === "boolean" ? checked : null,
-          language: typeof language === "string" ? language : null,
-          childIds,
-        });
-
-        for (const childId of childIds) {
-          visit(childId);
-        }
-      };
-
-      if (pageId) {
-        visit(pageId);
-      } else if (noteId) {
-        visit(noteId);
+      try {
+        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+        return text(projectReadDoc(doc, parsed.docId, { includeMarkdown: parsed.includeMarkdown, tagOptionsById }));
+      } finally {
+        doc.destroy();
       }
-      for (const [id] of blocks) {
-        const blockId = String(id);
-        if (!visited.has(blockId)) {
-          visit(blockId);
-        }
-      }
-
-      // If includeMarkdown is requested, reuse the same render path as export_doc_markdown
-      let markdown: string | undefined;
-      if (parsed.includeMarkdown) {
-        const collected = collectDocForMarkdown(doc, new Map());
-        const rendered = renderBlocksToMarkdown({
-          rootBlockIds: collected.rootBlockIds,
-          blocksById: collected.blocksById,
-        });
-        markdown = rendered.markdown;
-      }
-
-      return text({
-        docId: parsed.docId,
-        title: title || null,
-        tags,
-        exists: true,
-        blockCount: blockRows.length,
-        blocks: blockRows,
-        plainText: plainTextLines.join("\n"),
-        ...(markdown !== undefined ? { markdown } : {}),
-      });
     } finally {
       socket.disconnect();
     }
@@ -9775,14 +9816,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       if (params.text !== undefined) {
-        const rawText = block.get("prop:text");
-        const textMatches = typeof params.text === "string"
-          ? asText(rawText) === params.text
-          : isDeepStrictEqual(richTextValueToDeltas(rawText) ?? [], canonicalTextDeltas(params.text));
-        if (!textMatches) {
-          block.set("prop:text", makeText(params.text));
-          markChanged("text");
-        }
+        if (replaceBlockText(block, params.text)) markChanged("text");
       }
 
       if (changed.length > 0) {
@@ -10004,6 +10038,85 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   };
 
+  function deleteBlockInDoc(
+    doc: Y.Doc,
+    params: { blockId: string; deleteChildren?: boolean; pruneConnectors?: boolean; refuseSurfaceRoot?: boolean },
+  ) {
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+    const block = blocks.get(params.blockId);
+    if (!(block instanceof Y.Map)) {
+      return {
+        deleted: false,
+        blockId: params.blockId,
+        reason: "not-found",
+        deletedIds: [] as string[],
+        deletedBlock: null,
+        deletedBlocks: [] as Record<string, unknown>[],
+        prunedConnectors: [] as string[],
+      };
+    }
+    const flavour = block.get("sys:flavour");
+    if (flavour === "affine:page" || (params.refuseSurfaceRoot && flavour === "affine:surface")) {
+      throw new Error(`Refusing to delete document root block '${params.blockId}'.`);
+    }
+
+    const deleteRecursive = params.deleteChildren !== false;
+    const candidateIds = deleteRecursive ? collectDescendantBlockIds(blocks, [params.blockId]) : [params.blockId];
+    const deletedBlocks = candidateIds
+      .map(id => blockSnapshot(blocks, id))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    const deletedBlock = deletedBlocks.find(entry => entry.id === params.blockId) ?? null;
+    const deletedIds: string[] = [];
+    const walk = (id: string) => {
+      const current = blocks.get(id);
+      if (!(current instanceof Y.Map)) return;
+      if (deleteRecursive) {
+        for (const child of childIdsFrom(current.get("sys:children"))) walk(child);
+      }
+      blocks.delete(id);
+      deletedIds.push(id);
+    };
+    walk(params.blockId);
+
+    const deletedSet = new Set(deletedIds);
+    for (const [, maybeParent] of blocks.entries()) {
+      if (!(maybeParent instanceof Y.Map)) continue;
+      const children = maybeParent.get("sys:children");
+      if (!(children instanceof Y.Array)) continue;
+      const entries = children.toArray();
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (typeof entry === "string" && deletedSet.has(entry)) {
+          children.delete(index, 1);
+        } else if (Array.isArray(entry)) {
+          const retained = entry.filter(child => typeof child !== "string" || !deletedSet.has(child));
+          if (retained.length !== entry.length) {
+            children.delete(index, 1);
+            if (retained.length > 0) children.insert(index, [retained]);
+          }
+        }
+      }
+    }
+
+    const prunedConnectors: string[] = [];
+    if (params.pruneConnectors) {
+      const context = getSurfaceElementsValueMap(blocks, { create: false });
+      if (context) {
+        for (const [otherId, otherValue] of context.value.entries()) {
+          if (!(otherValue instanceof Y.Map) || otherValue.get("type") !== "connector") continue;
+          const source = otherValue.get("source");
+          const target = otherValue.get("target");
+          const sourceId = source && typeof source === "object" ? (source as any).id : undefined;
+          const targetId = target && typeof target === "object" ? (target as any).id : undefined;
+          if (deletedSet.has(sourceId) || deletedSet.has(targetId)) prunedConnectors.push(String(otherId));
+        }
+        for (const id of prunedConnectors) context.value.delete(id);
+      }
+    }
+    pruneFromFrameChildElementIds(blocks, [...deletedIds, ...prunedConnectors]);
+    return { deleted: true, blockId: params.blockId, deletedIds, deletedBlock, deletedBlocks, prunedConnectors };
+  }
+
   const deleteBlockHandler = async (params: {
     workspaceId?: string;
     docId: string;
@@ -10030,108 +10143,166 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
       Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
       const prevSV = Y.encodeStateVector(doc);
-      const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const block = blocks.get(params.blockId);
-      if (!(block instanceof Y.Map)) {
-        return text({
-          deleted: false,
-          blockId: params.blockId,
-          reason: "not-found",
-          deletedIds: [],
-          deletedBlock: null,
-          deletedBlocks: [],
-          prunedConnectors: [],
-        });
+      const result = deleteBlockInDoc(doc, params);
+      if (result.deleted) {
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, params.docId, Buffer.from(delta).toString("base64"));
       }
-
-      const flavour = block.get("sys:flavour");
-      if (flavour === "affine:page") {
-        throw new Error(`Refusing to delete page-root block '${params.blockId}' — use delete_doc for whole-doc removal.`);
-      }
-
-      const deleteRecursive = params.deleteChildren !== false;
-      const candidateIds = deleteRecursive
-        ? collectDescendantBlockIds(blocks, [params.blockId])
-        : [params.blockId];
-      const deletedBlocks = candidateIds
-        .map(id => blockSnapshot(blocks, id))
-        .filter((entry): entry is Record<string, unknown> => entry !== null);
-      const deletedBlock = deletedBlocks.find(entry => entry.id === params.blockId) ?? null;
-      const deletedIds: string[] = [];
-      const walk = (id: string) => {
-        const b = blocks.get(id);
-        if (!(b instanceof Y.Map)) return;
-        if (deleteRecursive) {
-          const children = b.get("sys:children");
-          if (children instanceof Y.Array) {
-            for (const c of children.toArray()) {
-              if (typeof c === "string") walk(c);
-            }
-          }
-        }
-        blocks.delete(id);
-        deletedIds.push(id);
-      };
-      walk(params.blockId);
-
-      for (const [, maybeParent] of blocks.entries()) {
-        if (!(maybeParent instanceof Y.Map)) continue;
-        const kids = maybeParent.get("sys:children");
-        if (!(kids instanceof Y.Array)) continue;
-        const arr = kids.toArray();
-        for (let i = arr.length - 1; i >= 0; i--) {
-          if (typeof arr[i] === "string" && deletedIds.includes(arr[i] as string)) {
-            kids.delete(i, 1);
-          }
-        }
-      }
-
-      // Mirror delete_surface_element's pruneConnectors semantics.
-      const prunedConnectors: string[] = [];
-      if (params.pruneConnectors) {
-        const ctx = getSurfaceElementsValueMap(blocks, { create: false });
-        if (ctx) {
-          const toDelete: string[] = [];
-          for (const [otherId, otherVal] of ctx.value.entries()) {
-            if (!(otherVal instanceof Y.Map)) continue;
-            if (otherVal.get("type") !== "connector") continue;
-            const source = otherVal.get("source");
-            const target = otherVal.get("target");
-            const srcId = source && typeof source === "object" ? (source as any).id : undefined;
-            const tgtId = target && typeof target === "object" ? (target as any).id : undefined;
-            if (
-              (typeof srcId === "string" && deletedIds.includes(srcId)) ||
-              (typeof tgtId === "string" && deletedIds.includes(tgtId))
-            ) {
-              toDelete.push(String(otherId));
-            }
-          }
-          for (const id of toDelete) {
-            ctx.value.delete(id);
-            prunedConnectors.push(id);
-          }
-        }
-      }
-
-      pruneFromFrameChildElementIds(blocks, [...deletedIds, ...prunedConnectors]);
-
-      const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(
-        socket,
-        workspaceId,
-        params.docId,
-        Buffer.from(delta).toString("base64")
-      );
-      return text({
-        deleted: true,
-        blockId: params.blockId,
-        deletedIds,
-        deletedBlock,
-        deletedBlocks,
-        prunedConnectors,
-      });
+      return text(result);
     } finally {
       socket.disconnect();
+    }
+  };
+
+  async function loadCurrentDocBytes(workspaceId: string, docId: string): Promise<Uint8Array | null> {
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, docId);
+      return snapshot.missing ? new Uint8Array(Buffer.from(snapshot.missing, "base64")) : null;
+    } finally {
+      socket.disconnect();
+    }
+  }
+
+  async function pushPreparedDocBytes(workspaceId: string, docId: string, update: Uint8Array): Promise<void> {
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      await pushDocUpdate(socket, workspaceId, docId, Buffer.from(update).toString("base64"));
+    } finally {
+      socket.disconnect();
+    }
+  }
+
+  const docPatches = createDocPatchManager({
+    loadCurrent: loadCurrentDocBytes,
+    pushUpdate: pushPreparedDocBytes,
+  });
+
+  function applyPatchOperations(doc: Y.Doc, operations: PatchOperation[]): void {
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+    operations.forEach((operation, operationIndex) => {
+      try {
+        if (operation.type === "replace_block_text") {
+          const block = findBlockById(blocks, operation.blockId);
+          if (!block) throw new Error(`Block '${operation.blockId}' was not found.`);
+          if (!editableBlockType(block)) {
+            throw new Error(`Block '${operation.blockId}' does not support text replacement.`);
+          }
+          const current = block.get("prop:text");
+          if (current !== undefined && current !== null && typeof current !== "string" && !(current instanceof Y.Text)) {
+            throw new Error(`Block '${operation.blockId}' has an unsupported prop:text value.`);
+          }
+          replaceBlockText(block, operation.text);
+          return;
+        }
+
+        if (operation.type === "insert_block") {
+          const parent = findBlockById(blocks, operation.parentId);
+          if (!parent) throw new Error(`Parent block '${operation.parentId}' was not found.`);
+          const parentFlavour = parent.get("sys:flavour");
+          if (!["affine:note", "affine:paragraph", "affine:list"].includes(String(parentFlavour))) {
+            throw new Error(`Parent '${operation.parentId}' has unsupported flavour '${String(parentFlavour)}'.`);
+          }
+          const anchorId = operation.placement && (
+            "afterBlockId" in operation.placement
+              ? operation.placement.afterBlockId
+              : operation.placement.beforeBlockId
+          );
+          if (anchorId) {
+            const children = parent.get("sys:children");
+            if (!(children instanceof Y.Array) || indexOfChild(children, anchorId) < 0) {
+              throw new Error(`Placement anchor '${anchorId}' is not a direct child of parent '${operation.parentId}'.`);
+            }
+          }
+          const placement: AppendPlacement = {
+            parentId: operation.parentId,
+            ...(operation.placement ?? {}),
+          };
+          const blockInput = operation.block;
+          const normalized = normalizeAppendBlockInput({
+            docId: "prepared",
+            type: blockInput.type,
+            text: blockInput.text,
+            ...(blockInput.type === "heading" ? { level: blockInput.level } : {}),
+            ...(blockInput.type === "list" ? { style: blockInput.style, checked: blockInput.checked } : {}),
+            ...(blockInput.type === "code" ? { language: blockInput.language } : {}),
+            strict: true,
+            placement,
+          });
+          insertBlockIntoDoc(doc, normalized);
+          return;
+        }
+
+        const target = findBlockById(blocks, operation.blockId);
+        if (!target) throw new Error(`Block '${operation.blockId}' was not found.`);
+        const subtree = collectDescendantBlockIds(blocks, [operation.blockId]);
+        const protectedId = subtree.find(id => {
+          const flavour = findBlockById(blocks, id)?.get("sys:flavour");
+          return flavour === "affine:page" || flavour === "affine:surface";
+        });
+        if (protectedId) throw new Error(`Subtree contains protected document root '${protectedId}'.`);
+        deleteBlockInDoc(doc, {
+          blockId: operation.blockId,
+          deleteChildren: true,
+          pruneConnectors: false,
+          refuseSurfaceRoot: true,
+        });
+      } catch (error) {
+        throw new DocPatchError(
+          "PATCH_INVALID_OPERATION",
+          error instanceof Error ? error.message : String(error),
+          false,
+          { operationIndex },
+        );
+      }
+    });
+  }
+
+  function patchFailure(error: unknown, patchId?: string) {
+    const patchError = error instanceof DocPatchError ? error : null;
+    return toolError(error, {
+      code: patchError?.code ?? "PATCH_FAILED",
+      retryable: patchError?.retryable ?? false,
+      data: patchId ? { patchId } : undefined,
+      details: patchError?.details,
+    });
+  }
+
+  const prepareDocPatchHandler = async (raw: unknown) => {
+    const parsed = PrepareDocPatchInput.parse(raw);
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) return patchFailure(new DocPatchError("PATCH_WORKSPACE_REQUIRED", "workspaceId is required."));
+    try {
+      return text(await docPatches.prepare({
+        workspaceId,
+        docId: parsed.docId,
+        input: parsed,
+        mutate: proposed => applyPatchOperations(proposed, parsed.operations),
+      }));
+    } catch (error) {
+      return patchFailure(error);
+    }
+  };
+
+  const applyDocPatchHandler = async (raw: unknown) => {
+    const parsed = ApplyDocPatchInput.parse(raw);
+    try {
+      return text(await docPatches.apply(parsed.patchId));
+    } catch (error) {
+      return patchFailure(error, parsed.patchId);
+    }
+  };
+
+  const discardDocPatchHandler = async (raw: unknown) => {
+    const parsed = DiscardDocPatchInput.parse(raw);
+    try {
+      return text(docPatches.discard(parsed.patchId));
+    } catch (error) {
+      return patchFailure(error, parsed.patchId);
     }
   };
 
@@ -10515,6 +10686,36 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   server.registerTool(
+    "prepare_doc_patch",
+    {
+      title: "Prepare Document Patch",
+      description: "Prepare an immutable document update and return the complete server-generated structural diff for human review. This does not write to AFFiNE.",
+      inputSchema: PrepareDocPatchInput,
+    } as any,
+    prepareDocPatchHandler as any,
+  );
+
+  server.registerTool(
+    "apply_doc_patch",
+    {
+      title: "Apply Document Patch",
+      description: "Apply one previously reviewed patch by id after verifying that its base document is still current.",
+      inputSchema: ApplyDocPatchInput,
+    } as any,
+    applyDocPatchHandler as any,
+  );
+
+  server.registerTool(
+    "discard_doc_patch",
+    {
+      title: "Discard Document Patch",
+      description: "Discard a prepared patch without writing to AFFiNE. Repeated discard requests are idempotent.",
+      inputSchema: DiscardDocPatchInput,
+    } as any,
+    discardDocPatchHandler as any,
+  );
+
+  server.registerTool(
     "update_block",
     {
       title: "Update Block",
@@ -10603,4 +10804,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     getEdgelessCanvasHandler as any
   );
+
+  return { projectReadDoc };
 }

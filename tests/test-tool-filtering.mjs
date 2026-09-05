@@ -158,6 +158,10 @@ async function run() {
       toolsByName.trash_doc?.annotations?.idempotentHint === true &&
       toolsByName.restore_doc?.annotations?.destructiveHint === false &&
       toolsByName.restore_doc?.annotations?.idempotentHint === true &&
+      toolsByName.apply_doc_patch?.annotations?.destructiveHint === true &&
+      toolsByName.prepare_doc_patch?.annotations?.readOnlyHint === false &&
+      toolsByName.discard_doc_patch?.annotations?.idempotentHint === true &&
+      toolsByName.diff_doc_revision?.annotations?.readOnlyHint === true &&
       toolsByName.create_doc?.annotations?.readOnlyHint === false &&
       toolsByName.create_doc?.annotations?.destructiveHint === false;
     if (missingAnnotations.length === 0 && annotationExpectations) {
@@ -267,9 +271,12 @@ async function run() {
       "update_database_row",
       "add_surface_element",
       "read_all_notifications",
+      "prepare_doc_patch",
+      "apply_doc_patch",
+      "discard_doc_patch",
     ];
     const visibleWrites = readOnlyHidden.filter(t => tools6.includes(t));
-    const expectedReads = ["read_doc", "search_docs", "get_edgeless_canvas", "list_comments"];
+    const expectedReads = ["read_doc", "read_doc_revision", "diff_doc_revision", "search_docs", "get_edgeless_canvas", "list_comments"];
     const missingReads = expectedReads.filter(t => !tools6.includes(t));
     if (visibleWrites.length === 0 && missingReads.length === 0) {
       console.log("✅ Success: Read-only profile keeps read tools and hides write tools.");
@@ -290,7 +297,7 @@ async function run() {
       "add_organize_link",
     ];
     const unexpectedlyVisible = trimmed.filter(t => tools7.includes(t));
-    const coreExpected = ["create_doc", "append_block", "move_block", "read_doc", "trash_doc", "restore_doc", "update_block", "update_table_cell", "update_database_row"];
+    const coreExpected = ["create_doc", "append_block", "move_block", "read_doc", "trash_doc", "restore_doc", "update_block", "update_table_cell", "update_database_row", "prepare_doc_patch", "apply_doc_patch", "discard_doc_patch"];
     const coreMissing = coreExpected.filter(t => !tools7.includes(t));
     if (unexpectedlyVisible.length === 0 && coreMissing.length === 0) {
       console.log("✅ Success: Core profile exposes the compact everyday surface.");
@@ -309,9 +316,10 @@ async function run() {
       "delete_surface_element",
       "cleanup_blobs",
       "update_profile",
+      "apply_doc_patch",
     ];
     const visibleRestricted = hiddenAuthoring.filter(t => tools8.includes(t));
-    const expectedAuthoring = ["create_semantic_page", "instantiate_template_native", "add_surface_element", "move_block", "trash_doc", "restore_doc", "update_block", "update_table_cell", "update_surface_element"];
+    const expectedAuthoring = ["create_semantic_page", "instantiate_template_native", "add_surface_element", "move_block", "trash_doc", "restore_doc", "update_block", "update_table_cell", "update_surface_element", "prepare_doc_patch", "discard_doc_patch", "read_doc_revision", "diff_doc_revision"];
     const missingAuthoring = expectedAuthoring.filter(t => !tools8.includes(t));
     if (visibleRestricted.length === 0 && missingAuthoring.length === 0) {
       console.log("✅ Success: Authoring profile keeps editing tools while hiding restricted tools.");

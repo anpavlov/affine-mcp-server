@@ -9,6 +9,7 @@ export const ALL_TOOLS = [
   "append_block",
   "append_markdown",
   "append_semantic_section",
+  "apply_doc_patch",
   "cleanup_blobs",
   "clear_doc_property",
   "compose_database_from_intent",
@@ -35,6 +36,8 @@ export const ALL_TOOLS = [
   "delete_surface_element",
   "delete_tag",
   "delete_workspace",
+  "diff_doc_revision",
+  "discard_doc_patch",
   "export_doc_markdown",
   "export_with_fidelity_report",
   "find_doc_by_title",
@@ -64,11 +67,13 @@ export const ALL_TOOLS = [
   "move_block",
   "move_doc",
   "move_organize_node",
+  "prepare_doc_patch",
   "publish_doc",
   "read_all_notifications",
   "read_database_cells",
   "read_database_columns",
   "read_doc",
+  "read_doc_revision",
   "remove_doc_from_collection",
   "remove_tag_from_doc",
   "rename_folder",
@@ -118,6 +123,7 @@ const TOOL_GROUPS: Record<ToolName, readonly string[]> = {
   append_block: ["docs", "docs.write", "write"],
   append_markdown: ["docs", "docs.markdown", "docs.write", "write"],
   append_semantic_section: ["docs", "docs.semantic", "docs.write", "write"],
+  apply_doc_patch: ["docs", "docs.patch", "docs.write", "destructive", "write"],
   cleanup_blobs: ["blobs", "blobs.write", "cleanup", "destructive", "write"],
   clear_doc_property: ["docs", "docs.properties", "docs.write", "write"],
   compose_database_from_intent: ["docs", "docs.database", "docs.intent", "docs.write", "write"],
@@ -144,6 +150,8 @@ const TOOL_GROUPS: Record<ToolName, readonly string[]> = {
   delete_surface_element: ["docs", "docs.edgeless", "docs.surface", "docs.write", "destructive", "write"],
   delete_tag: ["docs", "docs.tags", "docs.write", "destructive", "write"],
   delete_workspace: ["workspaces", "workspaces.write", "admin", "destructive", "write"],
+  diff_doc_revision: ["history", "history.read", "read"],
+  discard_doc_patch: ["docs", "docs.patch", "docs.write", "write"],
   export_doc_markdown: ["docs", "docs.export", "docs.markdown", "docs.read", "read"],
   export_with_fidelity_report: ["docs", "docs.export", "docs.markdown", "docs.read", "read"],
   find_doc_by_title: ["docs", "docs.read", "read"],
@@ -174,10 +182,12 @@ const TOOL_GROUPS: Record<ToolName, readonly string[]> = {
   move_doc: ["docs", "docs.tree", "docs.write", "write"],
   move_organize_node: ["organize", "organize.folders", "organize.write", "experimental", "write"],
   publish_doc: ["docs", "docs.share", "docs.write", "write"],
+  prepare_doc_patch: ["docs", "docs.patch", "docs.write", "write"],
   read_all_notifications: ["notifications", "notifications.write", "write"],
   read_database_cells: ["docs", "docs.database", "docs.read", "read"],
   read_database_columns: ["docs", "docs.database", "docs.read", "read"],
   read_doc: ["docs", "docs.read", "read"],
+  read_doc_revision: ["history", "history.read", "read"],
   remove_doc_from_collection: ["organize", "organize.collections", "organize.write", "write"],
   remove_tag_from_doc: ["docs", "docs.tags", "docs.write", "write"],
   rename_folder: ["organize", "organize.folders", "organize.write", "experimental", "write"],
@@ -210,6 +220,7 @@ const TOOL_GROUPS: Record<ToolName, readonly string[]> = {
 const READ_ONLY_TOOLS = new Set<ToolName>([
   "analyze_doc_fidelity",
   "current_user",
+  "diff_doc_revision",
   "export_doc_markdown",
   "export_with_fidelity_report",
   "find_doc_by_title",
@@ -238,6 +249,7 @@ const READ_ONLY_TOOLS = new Set<ToolName>([
   "read_database_cells",
   "read_database_columns",
   "read_doc",
+  "read_doc_revision",
   "search_docs",
   "sign_in",
 ]);
@@ -248,6 +260,7 @@ const CORE_TOOLS = new Set<ToolName>([
   "add_tag_to_doc",
   "append_block",
   "append_markdown",
+  "apply_doc_patch",
   "create_doc",
   "create_doc_from_markdown",
   "current_user",
@@ -266,6 +279,7 @@ const CORE_TOOLS = new Set<ToolName>([
   "read_database_cells",
   "read_database_columns",
   "read_doc",
+  "prepare_doc_patch",
   "remove_tag_from_doc",
   "replace_doc_with_markdown",
   "restore_doc",
@@ -277,6 +291,7 @@ const CORE_TOOLS = new Set<ToolName>([
   "update_doc_icon",
   "update_doc_title",
   "update_table_cell",
+  "discard_doc_patch",
 ]);
 
 const AUTHORING_EXCLUDED_GROUPS = new Set([
@@ -287,6 +302,7 @@ const AUTHORING_EXCLUDED_GROUPS = new Set([
 ]);
 
 const IDEMPOTENT_WRITE_TOOLS = new Set<ToolName>([
+  "discard_doc_patch",
   "restore_doc",
   "trash_doc",
 ]);

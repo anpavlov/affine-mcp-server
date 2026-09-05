@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.5.0-docpatch.1.0]
+
+### Added
+- Added reviewed document patches with `prepare_doc_patch`, `apply_doc_patch`, and `discard_doc_patch`, including immutable session-local payloads, full structural diffs, stale detection, and conservative unknown-delivery handling.
+- Added binary `read_doc_revision` and `diff_doc_revision` history tools. Binary document properties are represented in diffs only by byte length and SHA-256 fingerprints.
+- The canonical MCP tool surface now contains 102 tools.
 
 ## [3.5.0] - 2026-08-31
 

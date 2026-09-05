@@ -32,6 +32,24 @@ for (const name of ALL_TOOLS) {
 
 assert.equal(toolOutputSchemaFor("not_a_real_tool"), undefined);
 
+const preparedPatchOutput = {
+  patchId: "dp_11111111111111111111111111111111",
+  workspaceId: "workspace-1",
+  docId: "doc-1",
+  status: "prepared",
+  summary: "1 block changed",
+  diff: { scope: "document_blocks", structural: [], unified: "", stats: { added: 0, deleted: 0, changed: 1 } },
+  expiresAt: "2026-09-05T00:30:00.000Z",
+};
+assert.equal(toolOutputSchemaFor("prepare_doc_patch").safeParse(preparedPatchOutput).success, true);
+for (const leakedField of ["update", "baseSnapshotHash", "reviewText", "operations"]) {
+  assert.equal(
+    toolOutputSchemaFor("prepare_doc_patch").safeParse({ ...preparedPatchOutput, [leakedField]: "secret" }).success,
+    false,
+    `prepare_doc_patch output schema admitted internal field ${leakedField}`,
+  );
+}
+
 const arrayTextResult = text(["one", "two"]);
 assert.deepEqual(arrayTextResult.content, [{ type: "text", text: '["one","two"]' }]);
 assert.deepEqual(arrayTextResult.structuredContent, { items: ["one", "two"] });

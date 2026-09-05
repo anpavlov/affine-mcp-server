@@ -102,6 +102,16 @@ Use this document as a grouped catalog. For exact schemas, your MCP client shoul
 | `append_markdown` | Append Markdown content to an existing document | |
 | `replace_doc_with_markdown` | Replace the main note content with Markdown | Applies the replacement as an all-or-nothing local batch; empty output requires `allowEmpty: true` |
 
+### Reviewed document patches
+
+| Tool | Purpose | Notes |
+| --- | --- | --- |
+| `prepare_doc_patch` | Prepare text replacement, block insertion, and subtree deletion as one immutable update | Returns the complete server-generated structural diff and expiry time; never writes to AFFiNE |
+| `apply_doc_patch` | Apply a reviewed patch by `patchId` | Destructive; rejects stale, expired, discarded, consumed, busy, and delivery-unknown patches |
+| `discard_doc_patch` | Discard a prepared patch | Session-local and idempotent; never writes to AFFiNE |
+
+Patch inputs are strict. `prepare_doc_patch.operations` accepts `replace_block_text`, `insert_block`, and `delete_block_subtree` (1–100 operations). Inserted blocks are limited to paragraph, quote, heading, list, and code blocks under an existing note, paragraph, or list. Patches expire after 30 minutes and are lost when the MCP session ends. The public diff covers every document block and represents binary values only as byte length plus a full SHA-256 digest; it never exposes the prepared Yjs update.
+
 #### Formatting-preserving block text
 
 For inline-rich-text blocks, `append_block.text`, `update_block.text`, and `update_table_cell.text` accept either a string or a delta array. Each delta requires a string `insert` and may contain arbitrary `attributes`; the server passes attributes through without restricting them to a fixed formatting vocabulary.
@@ -195,6 +205,8 @@ When the new block is a frame/note/edgeless_text on the canvas, `append_block` a
 | Tool | Purpose | Notes |
 | --- | --- | --- |
 | `list_histories` | List document history timestamps | |
+| `read_doc_revision` | Read one historical document snapshot | Uses the same block projection as `read_doc`; requires an ISO timestamp with timezone |
+| `diff_doc_revision` | Compare a revision with another revision or current state | Uses the same authoritative structural diff as reviewed patches; binary values are fingerprints |
 
 ## Users and authentication
 

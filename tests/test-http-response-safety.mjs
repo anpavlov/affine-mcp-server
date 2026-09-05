@@ -11,6 +11,7 @@ import { loginWithPassword } from "../dist/auth.js";
 import { GraphQLClient } from "../dist/graphqlClient.js";
 import {
   fetchResponseBody,
+  fetchResponseBytes,
   MAX_HTTP_RESPONSE_BYTES,
 } from "../dist/util/httpResponse.js";
 import { registerWorkspaceTools } from "../dist/tools/workspaces.js";
@@ -84,6 +85,12 @@ async function testSharedReader(baseUrl, fetcher, label) {
     { label, maxResponseBytes: 128, timeoutMs: 1_000 },
   );
   assert.equal(ok.body, '{"ok":true}');
+
+  const binary = await fetchResponseBytes(
+    signal => fetcher(`${baseUrl}/ok`, { signal }),
+    { label, maxResponseBytes: 128, timeoutMs: 1_000 },
+  );
+  assert.deepEqual([...binary.body], [...Buffer.from('{"ok":true}', "utf8")]);
 
   const atLimit = await fetchResponseBody(
     signal => fetcher(`${baseUrl}/at-limit`, { signal }),

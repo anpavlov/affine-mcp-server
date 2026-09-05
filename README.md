@@ -38,7 +38,7 @@ Highlights:
 - Supports AFFiNE Cloud and self-hosted AFFiNE instances
 - Supports stdio and HTTP transports
 - Supports session-cookie and email/password authentication, plus compatible bearer tokens for older deployments
-- Exposes 96 canonical MCP tools backed by AFFiNE GraphQL and WebSocket APIs
+- Exposes 102 canonical MCP tools backed by AFFiNE GraphQL, REST, and WebSocket APIs
 - Includes semantic page composition, native template instantiation, database intent composition, capability and fidelity reporting, and workspace blueprint helpers
 - Includes Docker images, health probes, and end-to-end test coverage
 
@@ -190,7 +190,7 @@ Domains:
 - Documents: search, read, create, publish, move, tag, custom properties, import/export, semantic composition, template inspection and native instantiation, capability and fidelity reporting, and block-level mutation
 - Databases: create columns, add rows, update rows, inspect schema, and compose database structures from intent
 - Comments: list, create, update, delete, and resolve
-- History: version history listing
+- History: version history listing, historical snapshot reads, and structural revision diffs
 - Users and authentication: current user, sign-in, and profile/settings
 - Notifications: list and mark notifications as read
 - Blob storage: upload, delete, and cleanup blobs

@@ -89,8 +89,26 @@ registerWorkspaceTools(registry, gql);
 function toolSchema(name) {
   const fields = registry.tools.get(name)?.definition?.inputSchema;
   assert(fields, `${name} input schema is missing`);
-  return z.object(fields);
+  return fields instanceof z.ZodType ? fields : z.object(fields);
 }
+
+const preparePatchSchema = toolSchema("prepare_doc_patch");
+assert.equal(preparePatchSchema.safeParse({
+  docId: "doc-1",
+  operations: [{ type: "replace_block_text", blockId: "p1", text: "next" }],
+}).success, true);
+expectSchemaRejects(preparePatchSchema, [
+  { docId: "doc-1", operations: [] },
+  { docId: "doc-1", operations: [{ type: "replace_block_text", blockId: "p1", text: "next", extra: true }] },
+  { docId: "doc-1", operations: [{ type: "insert_block", parentId: "n1", block: { type: "list", checked: true } }] },
+  { docId: "doc-1", operations: [{ type: "insert_block", parentId: "n1", block: { type: "image" } }] },
+  { docId: "doc-1", operations: [{ type: "delete_block_subtree", blockId: "p1" }], extra: true },
+]);
+expectSchemaRejects(toolSchema("apply_doc_patch"), [
+  { patchId: "not-a-patch" },
+  { patchId: "dp_11111111111111111111111111111111", operations: [] },
+  { patchId: "dp_11111111111111111111111111111111", update: "base64" },
+]);
 
 const highlightedText = [
   { insert: "plain " },
