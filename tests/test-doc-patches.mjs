@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as Y from "yjs";
 
 import { diffDocStates } from "../src/docDiff.ts";
-import { createDocPatchManager, DocPatchError } from "../src/docPatches.ts";
+import { createDocPatchManager, createDocPatchStore, DocPatchError } from "../src/docPatches.ts";
 import { toolOutputSchemaFor } from "../src/toolOutputSchemas.ts";
 import { registerDocTools } from "../src/tools/docs.ts";
 
@@ -120,7 +120,9 @@ assert.equal(stalePushes, 0);
 
 let releaseLoad;
 let loadCount = 0;
+const busyStore = createDocPatchStore();
 const busyManager = createDocPatchManager({
+  store: busyStore,
   loadCurrent: async () => {
     loadCount += 1;
     if (loadCount === 1) return bytes(staleBase);
@@ -135,8 +137,13 @@ const busyPatch = await busyManager.prepare({
 });
 const applying = busyManager.apply(busyPatch.patchId);
 await Promise.resolve();
-assert.throws(() => busyManager.discard(busyPatch.patchId), error => error.code === "PATCH_BUSY");
-await assert.rejects(busyManager.apply(busyPatch.patchId), error => error.code === "PATCH_BUSY");
+const otherBusyManager = createDocPatchManager({
+  store: busyStore,
+  loadCurrent: async () => { assert.fail("busy patch must not load again"); },
+  pushUpdate: async () => { assert.fail("busy patch must not push again"); },
+});
+assert.throws(() => otherBusyManager.discard(busyPatch.patchId), error => error.code === "PATCH_BUSY");
+await assert.rejects(otherBusyManager.apply(busyPatch.patchId), error => error.code === "PATCH_BUSY");
 releaseLoad(bytes(staleBase));
 await applying;
 
@@ -201,8 +208,28 @@ await assert.rejects(
   createDocPatchManager({ loadCurrent: async () => bytes(staleBase), pushUpdate: async () => {} })
     .apply(discardedPatch.patchId),
   error => error.code === "PATCH_NOT_FOUND",
-  "patch stores must be isolated by session",
+  "separate stores must remain isolated",
 );
+
+const limitedStore = createDocPatchStore();
+let storeClock = 1000;
+const limitedDependencies = {
+  store: limitedStore, maxRecords: 1, ttlMs: 10, now: () => storeClock,
+  loadCurrent: async () => bytes(staleBase), pushUpdate: async () => {},
+};
+const limitedA = createDocPatchManager({ ...limitedDependencies, scope: "a" });
+const limitedB = createDocPatchManager({ ...limitedDependencies, scope: "b" });
+const limitedInput = {
+  workspaceId: "w", docId: "d", input: {},
+  mutate: doc => doc.getMap("blocks").get("p1").set("prop:text", text("limited")),
+};
+const limitedPatch = await limitedA.prepare(limitedInput);
+assert.equal(limitedB.discard(limitedPatch.patchId).status, "not_found");
+await assert.rejects(limitedB.prepare(limitedInput), error => error.code === "PATCH_STORE_FULL");
+storeClock += 10;
+await assert.rejects(createDocPatchManager({ ...limitedDependencies, scope: "a" }).apply(limitedPatch.patchId),
+  error => error.code === "PATCH_EXPIRED");
+assert.ok((await limitedB.prepare(limitedInput)).patchId, "expired records must release shared capacity");
 
 const binaryBase = fixture();
 const originalBuffer = Uint8Array.from([9, 1, 2, 3, 9]);
@@ -294,6 +321,73 @@ const invalidApply = await client.callTool({
 assert.equal(invalidApply.isError, true);
 assert.equal(connectionAttempts, 0, "strict MCP input reached backend code");
 await clientTransport.close();
+
+// Real registered handlers on independent MCP connections, sharing only storage.
+const sharedStore = createDocPatchStore();
+const sharedDoc = fixture();
+let sharedPushes = 0;
+async function patchSession(store = sharedStore, cookie = "account-a", endpoint = "https://affine.test/graphql") {
+  const server = new McpServer({ name: "cross-session", version: "1" });
+  const register = server.registerTool.bind(server);
+  server.registerTool = (name, options, handler) => register(name, {
+    ...options, outputSchema: toolOutputSchemaFor(name),
+  }, handler);
+  registerDocTools(server, {
+    getConnectionAuth: async () => ({ endpoint, cookie }),
+  }, { workspaceId: "workspace" }, {
+    store,
+    backend: {
+      loadCurrent: async () => bytes(sharedDoc),
+      pushUpdate: async (_w, _d, update) => {
+        sharedPushes++;
+        Y.applyUpdate(sharedDoc, update);
+      },
+    },
+  });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "cross-session", version: "1" });
+  await Promise.all([server.connect(st), client.connect(ct)]);
+  return { client, close: () => ct.close() };
+}
+function payload(result) {
+  return result.structuredContent ?? JSON.parse(result.content[0].text);
+}
+const first = await patchSession();
+const prepareAcross = async (session, value) => payload(await session.client.callTool({
+  name: "prepare_doc_patch", arguments: {
+    docId: "doc", operations: [{ type: "replace_block_text", blockId: "p1", text: value }],
+  },
+}));
+const crossPatch = await prepareAcross(first, "across sessions");
+assert.ok(crossPatch.patchId);
+assert.equal(sharedPushes, 0);
+await first.close();
+const second = await patchSession();
+const otherAccount = await patchSession(sharedStore, "account-b");
+const otherEndpoint = await patchSession(sharedStore, "account-a", "https://other.test/graphql");
+const restarted = await patchSession(createDocPatchStore());
+for (const session of [otherAccount, otherEndpoint, restarted]) {
+  const result = await session.client.callTool({ name: "apply_doc_patch", arguments: { patchId: crossPatch.patchId } });
+  assert.equal(result.isError, true);
+  assert.match(JSON.stringify(result), /PATCH_NOT_FOUND/);
+  await session.close();
+}
+const crossApplied = await second.client.callTool({ name: "apply_doc_patch", arguments: { patchId: crossPatch.patchId } });
+assert.equal(payload(crossApplied).status, "consumed");
+assert.equal(sharedPushes, 1);
+assert.equal(sharedDoc.getMap("blocks").get("p1").get("prop:text").toString(), "across sessions");
+const third = await patchSession();
+const replay = await third.client.callTool({ name: "apply_doc_patch", arguments: { patchId: crossPatch.patchId } });
+assert.match(JSON.stringify(replay), /PATCH_CONSUMED/);
+const crossDiscardedPatch = await prepareAcross(second, "discard this");
+const crossDiscarded = await third.client.callTool({ name: "discard_doc_patch", arguments: { patchId: crossDiscardedPatch.patchId } });
+assert.equal(payload(crossDiscarded).status, "discarded");
+const discardedApply = await second.client.callTool({ name: "apply_doc_patch", arguments: { patchId: crossDiscardedPatch.patchId } });
+assert.match(JSON.stringify(discardedApply), /PATCH_DISCARDED/);
+assert.equal(sharedPushes, 1);
+await second.close();
+await third.close();
+sharedDoc.destroy();
 
 for (const doc of [currentDoc, applied, staleBase, concurrent, binaryBase, binaryLoaded, binarySame, binaryChanged, richBase, richChanged, deleteBase, deleteChanged, largeBinaryBase, largeBinaryChanged]) doc.destroy();
 console.log("Verified document patch diff, immutable update, lifecycle, stale checks, and binary fingerprints.");

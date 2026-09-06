@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { createHash } from "node:crypto";
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -41,7 +42,7 @@ import { richTextValueToDeltas, richTextValueToString } from "../markdown/richTe
 import { buildMarkdownFrontmatter } from "../markdown/safety.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
 import { addOrganizeLinkToFolder } from "./organize.js";
-import { createDocPatchManager, DocPatchError } from "../docPatches.js";
+import { createDocPatchManager, createDocPatchStore, DocPatchError, type DocPatchStore, type PatchManagerDependencies } from "../docPatches.js";
 import {
   type Bound,
   DEFAULT_NOTE_XYWH,
@@ -1035,7 +1036,10 @@ export function createAcknowledgedDeletedDocTracker({
   };
 }
 
-export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults: { workspaceId?: string }) {
+export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults: { workspaceId?: string }, patchOptions: {
+  store?: DocPatchStore;
+  backend?: Pick<PatchManagerDependencies, "loadCurrent" | "pushUpdate">;
+} = {}) {
   const acknowledgedDeletedDocs = createAcknowledgedDeletedDocTracker();
 
   // helpers
@@ -10154,8 +10158,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   };
 
-  async function loadCurrentDocBytes(workspaceId: string, docId: string): Promise<Uint8Array | null> {
-    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+  async function loadCurrentDocBytes(workspaceId: string, docId: string, auth: Awaited<ReturnType<typeof getCookieAndEndpoint>>): Promise<Uint8Array | null> {
+    const { endpoint, cookie, bearer } = auth;
     const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
     try {
       await joinWorkspace(socket, workspaceId);
@@ -10166,8 +10170,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
-  async function pushPreparedDocBytes(workspaceId: string, docId: string, update: Uint8Array): Promise<void> {
-    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+  async function pushPreparedDocBytes(workspaceId: string, docId: string, update: Uint8Array, auth: Awaited<ReturnType<typeof getCookieAndEndpoint>>): Promise<void> {
+    const { endpoint, cookie, bearer } = auth;
     const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
     try {
       await joinWorkspace(socket, workspaceId);
@@ -10177,10 +10181,22 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
-  const docPatches = createDocPatchManager({
-    loadCurrent: loadCurrentDocBytes,
-    pushUpdate: pushPreparedDocBytes,
-  });
+  const patchStore = patchOptions.store ?? createDocPatchStore();
+  async function getDocPatchManager() {
+    const auth = await getCookieAndEndpoint();
+    // Do not retain credentials in the store. A credential change intentionally
+    // makes older patches inaccessible, even within the same MCP session.
+    const scope = createHash("sha256").update(JSON.stringify([
+      auth.endpoint, auth.cookie ?? "", auth.bearer ?? "",
+    ])).digest("hex");
+    return createDocPatchManager({
+      store: patchStore,
+      scope,
+      loadCurrent: (workspaceId, docId) => loadCurrentDocBytes(workspaceId, docId, auth),
+      pushUpdate: (workspaceId, docId, update) => pushPreparedDocBytes(workspaceId, docId, update, auth),
+      ...patchOptions.backend,
+    });
+  }
 
   function applyPatchOperations(doc: Y.Doc, operations: PatchOperation[]): void {
     const blocks = doc.getMap("blocks") as Y.Map<any>;
@@ -10277,6 +10293,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) return patchFailure(new DocPatchError("PATCH_WORKSPACE_REQUIRED", "workspaceId is required."));
     try {
+      const docPatches = await getDocPatchManager();
       return text(await docPatches.prepare({
         workspaceId,
         docId: parsed.docId,
@@ -10291,6 +10308,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   const applyDocPatchHandler = async (raw: unknown) => {
     const parsed = ApplyDocPatchInput.parse(raw);
     try {
+      const docPatches = await getDocPatchManager();
       return text(await docPatches.apply(parsed.patchId));
     } catch (error) {
       return patchFailure(error, parsed.patchId);
@@ -10300,6 +10318,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   const discardDocPatchHandler = async (raw: unknown) => {
     const parsed = DiscardDocPatchInput.parse(raw);
     try {
+      const docPatches = await getDocPatchManager();
       return text(docPatches.discard(parsed.patchId));
     } catch (error) {
       return patchFailure(error, parsed.patchId);

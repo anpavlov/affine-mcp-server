@@ -169,8 +169,8 @@ Typical tool sequence:
 2. Show the target workspace/document and the complete server-generated `diff` to the user.
 3. Stop and wait for explicit approval. Do not treat the request to prepare as approval to apply.
 4. On approval, call `apply_doc_patch` with exactly the returned `patchId`; otherwise call `discard_doc_patch`.
-5. If apply reports stale, unknown delivery, expiry, or a missing patch after a new session, read the document again and prepare a new patch for a new review.
+5. If apply reports stale, unknown delivery, expiry, or a missing patch, read the document again and prepare a new patch for a new review.
 
-Never reconstruct and replay previously approved operations after a stale/unknown/session-loss result. Prepared patches are session-local, expire after 30 minutes, and intentionally provide no strict compare-and-swap guarantee for a concurrent edit that lands between the final stale check and the push.
+Never reconstruct and replay previously approved operations after a stale/unknown/missing-patch result. Prepared patches are shared across MCP sessions in one server process for identical AFFiNE endpoint and backend credentials. They expire after 30 minutes and are lost on server restart; multiple replicas do not share them. Changing backend credentials requires a new prepare. Patches intentionally provide no strict compare-and-swap guarantee for a concurrent edit that lands between the final stale check and the push.
 
 To inspect older content, use `list_histories`, then `read_doc_revision` or `diff_doc_revision`. History reads do not fall back to the current document when a revision is missing or malformed.

@@ -5,6 +5,7 @@ import { CONFIG_FILE, loadConfig, type ServerConfig, VERSION } from "./config.js
 import { GraphQLClient } from "./graphqlClient.js";
 import { registerWorkspaceTools } from "./tools/workspaces.js";
 import { registerDocTools } from "./tools/docs.js";
+import { createDocPatchStore } from "./docPatches.js";
 import { registerCommentTools } from "./tools/comments.js";
 import { registerHistoryTools } from "./tools/history.js";
 import { registerUserTools } from "./tools/user.js";
@@ -160,6 +161,8 @@ if (
   );
 }
 
+const docPatchStore = createDocPatchStore();
+
 async function buildServer() {
   const server = new McpServer({ name: "affine-mcp", version: VERSION });
   const gqlHeaders = { ...(config.headers || {}) };
@@ -198,7 +201,7 @@ async function buildServer() {
   console.error(`[affine-mcp] Enabled tools: ${toolFilter.enabledTools.length}/${toolFilter.totalToolCount}`);
 
   registerWorkspaceTools(server, gql);
-  const { projectReadDoc } = registerDocTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  const { projectReadDoc } = registerDocTools(server, gql, { workspaceId: config.defaultWorkspaceId }, { store: docPatchStore });
   registerCommentTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   registerHistoryTools(server, gql, { workspaceId: config.defaultWorkspaceId }, projectReadDoc);
   registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });

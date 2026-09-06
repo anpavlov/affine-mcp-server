@@ -14,6 +14,7 @@ export const MAX_DOC_PATCH_RESULT_BYTES = 4 * 1024 * 1024;
 export type PatchStatus = "prepared" | "applying" | "consumed" | "discarded" | "unknown" | "expired";
 
 interface PreparedDocPatch {
+  readonly scope: string;
   readonly patchId: string;
   readonly workspaceId: string;
   readonly docId: string;
@@ -47,7 +48,9 @@ export class DocPatchError extends Error {
   }
 }
 
-type PatchManagerDependencies = {
+export type PatchManagerDependencies = {
+  store?: DocPatchStore;
+  scope?: string;
   loadCurrent(workspaceId: string, docId: string): Promise<Uint8Array | null>;
   pushUpdate(workspaceId: string, docId: string, update: Uint8Array): Promise<void>;
   now?: () => number;
@@ -59,6 +62,13 @@ type PatchManagerDependencies = {
   maxInputBytes?: number;
   maxResultBytes?: number;
 };
+
+// Explicitly owned by one server process; never a module-global singleton.
+export function createDocPatchStore() {
+  return new Map<string, PreparedDocPatch>();
+}
+
+export type DocPatchStore = ReturnType<typeof createDocPatchStore>;
 
 type PrepareOptions = {
   workspaceId: string;
@@ -87,7 +97,7 @@ function utf8Bytes(value: unknown): number {
 
 function recordBytes(record: PreparedDocPatch): number {
   return record.update.byteLength + Buffer.byteLength(
-    `${record.patchId}${record.workspaceId}${record.docId}${record.baseSnapshotHash}`,
+    `${record.scope}${record.patchId}${record.workspaceId}${record.docId}${record.baseSnapshotHash}`,
     "utf8",
   );
 }
@@ -106,7 +116,8 @@ export function createDocPatchManager(dependencies: PatchManagerDependencies) {
   const maxStoreBytes = dependencies.maxStoreBytes ?? MAX_DOC_PATCH_STORE_BYTES;
   const maxInputBytes = dependencies.maxInputBytes ?? MAX_DOC_PATCH_INPUT_BYTES;
   const maxResultBytes = dependencies.maxResultBytes ?? MAX_DOC_PATCH_RESULT_BYTES;
-  const records = new Map<string, PreparedDocPatch>();
+  const records = dependencies.store ?? createDocPatchStore();
+  const scope = dependencies.scope ?? "";
 
   function cleanup(currentTime: number, preservePatchId?: string): void {
     for (const [patchId, record] of records) {
@@ -117,7 +128,8 @@ export function createDocPatchManager(dependencies: PatchManagerDependencies) {
 
   function addressed(patchId: string): PreparedDocPatch | undefined {
     const currentTime = now();
-    const record = records.get(patchId);
+    const candidate = records.get(patchId);
+    const record = candidate?.scope === scope ? candidate : undefined;
     if (record && record.status === "prepared" && currentTime >= record.expiresAt) {
       record.status = "expired";
     }
@@ -195,6 +207,7 @@ export function createDocPatchManager(dependencies: PatchManagerDependencies) {
       }
 
       const record: PreparedDocPatch = {
+        scope,
         patchId,
         workspaceId: options.workspaceId,
         docId: options.docId,
@@ -204,9 +217,10 @@ export function createDocPatchManager(dependencies: PatchManagerDependencies) {
         expiresAt: createdAt + ttlMs,
         status: "prepared",
       };
+      cleanup(now());
       const retainedBytes = [...records.values()].reduce((total, entry) => total + recordBytes(entry), 0);
       if (records.size >= maxRecords || retainedBytes + recordBytes(record) > maxStoreBytes) {
-        throw new DocPatchError("PATCH_STORE_FULL", "The session patch store is full; discard or wait for existing patches to expire.");
+        throw new DocPatchError("PATCH_STORE_FULL", "The server patch store is full; wait for existing patches to expire.");
       }
       records.set(patchId, record);
       return result;
