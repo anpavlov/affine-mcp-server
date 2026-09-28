@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const RELEASE_TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const RELEASE_TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-docpatch\.(0|[1-9]\d*)\.(0|[1-9]\d*))?$/;
 
 function readJson(root, relativePath) {
   return JSON.parse(fs.readFileSync(path.join(root, relativePath), "utf8"));
@@ -27,7 +27,7 @@ function escapeRegExp(value) {
 export function versionFromReleaseTag(tag) {
   const match = RELEASE_TAG_PATTERN.exec(tag || "");
   if (!match) {
-    throw new Error(`Release tag must use the exact vX.Y.Z format; received ${JSON.stringify(tag)}.`);
+    throw new Error(`Release tag must use the exact vX.Y.Z format (or vX.Y.Z-docpatch.N.N for fork releases); received ${JSON.stringify(tag)}.`);
   }
   return tag.slice(1);
 }
@@ -47,7 +47,7 @@ export function validateReleaseMetadata(root, tag) {
   addMismatch(errors, "package-lock.json package version", packageLock.packages?.[""]?.version, version);
   addMismatch(errors, "tool-manifest.json version", toolManifest.version, version);
 
-  const badgeVersion = readme.match(/badge\/version-([0-9]+\.[0-9]+\.[0-9]+)-blue/)?.[1];
+  const badgeVersion = readme.match(/badge\/version-([0-9]+\.[0-9]+\.[0-9]+(?:--docpatch\.[0-9]+\.[0-9]+)?)-blue/)?.[1]?.replace("--docpatch", "-docpatch");
   addMismatch(errors, "README version badge", badgeVersion, version);
 
   const escapedVersion = escapeRegExp(version);

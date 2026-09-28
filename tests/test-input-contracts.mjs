@@ -2,12 +2,21 @@
 import "./require-destructive-test-safety.mjs";
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { z } from "zod";
+import * as Y from "yjs";
 
 import { registerBlobTools } from "../dist/tools/blobStorage.js";
 import { registerCommentTools } from "../dist/tools/comments.js";
-import { registerDocTools } from "../dist/tools/docs.js";
+import {
+  createDocContentWarnings,
+  readTableColumnWidth,
+  registerDocTools,
+  totalTableColumnWidth,
+  writeTableColumnWidth,
+} from "../dist/tools/docs.js";
 import { registerHistoryTools } from "../dist/tools/history.js";
+import { registerIconTools } from "../dist/tools/icons.js";
 import { registerNotificationTools } from "../dist/tools/notifications.js";
 import { registerUserCRUDTools } from "../dist/tools/userCRUD.js";
 import { registerWorkspaceTools } from "../dist/tools/workspaces.js";
@@ -19,6 +28,7 @@ import {
   BoundedTreeDepth,
   requireMatchingConfirmation,
 } from "../dist/util/inputSchemas.js";
+import { normalizeIconInput } from "../dist/util/explorerIcon.js";
 
 class ToolRegistry {
   tools = new Map();
@@ -82,6 +92,7 @@ registerBlobTools(registry, gql);
 registerCommentTools(registry, gql, {});
 registerDocTools(registry, gql, {});
 registerHistoryTools(registry, gql, {});
+registerIconTools(registry, gql, {});
 registerNotificationTools(registry, gql);
 registerUserCRUDTools(registry, gql);
 registerWorkspaceTools(registry, gql);
@@ -151,6 +162,68 @@ expectSchemaRejects(updateTableCellSchema, [
   { docId: "doc-1", blockId: "table-1", row: 0, column: 1.5, text: "x" },
 ]);
 
+const updateTableColumnWidthsSchema = toolSchema("update_table_column_widths");
+assert.equal(updateTableColumnWidthsSchema.safeParse({
+  docId: "doc-1",
+  blockId: "table-1",
+  widths: [60, null, 800],
+}).success, true);
+expectSchemaRejects(updateTableColumnWidthsSchema, [
+  { docId: "doc-1", blockId: "table-1", widths: [] },
+  { docId: "doc-1", blockId: "table-1", widths: [59] },
+  { docId: "doc-1", blockId: "table-1", widths: [4097] },
+  { docId: "doc-1", blockId: "table-1", widths: [Number.POSITIVE_INFINITY] },
+]);
+
+const flatDoc = new Y.Doc();
+const flatTable = flatDoc.getMap("flat-table");
+const preservedCell = new Y.Text();
+preservedCell.applyDelta([{ insert: "Keep", attributes: { bold: true } }]);
+flatTable.set("prop:cells.row-1:column-1.text", preservedCell);
+writeTableColumnWidth(flatTable, "column-1", 272);
+assert.equal(flatTable.get("prop:columns.column-1.width"), 272);
+assert.equal(readTableColumnWidth(flatTable, "column-1"), 272);
+assert.deepEqual(preservedCell.toDelta(), [{ insert: "Keep", attributes: { bold: true } }]);
+writeTableColumnWidth(flatTable, "column-1", null);
+assert.equal(flatTable.has("prop:columns.column-1.width"), false);
+assert.equal(readTableColumnWidth(flatTable, "column-1"), null);
+
+const nestedDoc = new Y.Doc();
+const nestedTable = nestedDoc.getMap("nested-table");
+const nestedColumns = new Y.Map();
+const nestedColumn = new Y.Map();
+nestedColumn.set("columnId", "column-1");
+nestedColumns.set("column-1", nestedColumn);
+nestedTable.set("prop:columns", nestedColumns);
+writeTableColumnWidth(nestedTable, "column-1", 528);
+assert.equal(readTableColumnWidth(nestedTable, "column-1"), 528);
+writeTableColumnWidth(nestedTable, "column-1", null);
+assert.equal(nestedColumn.has("width"), false);
+
+const objectDoc = new Y.Doc();
+const objectTable = objectDoc.getMap("object-table");
+objectTable.set("prop:columns", {
+  "column-1": { columnId: "column-1", order: "a0", width: 196, custom: "preserved" },
+  "column-2": { columnId: "column-2", order: "a1", width: 420 },
+});
+assert.equal(readTableColumnWidth(objectTable, "column-1"), 196);
+writeTableColumnWidth(objectTable, "column-1", 320);
+assert.deepEqual(objectTable.get("prop:columns"), {
+  "column-1": { columnId: "column-1", order: "a0", width: 320, custom: "preserved" },
+  "column-2": { columnId: "column-2", order: "a1", width: 420 },
+});
+assert.equal(objectTable.has("prop:columns.column-1.width"), false);
+writeTableColumnWidth(objectTable, "column-1", null);
+assert.deepEqual(objectTable.get("prop:columns"), {
+  "column-1": { columnId: "column-1", order: "a0", custom: "preserved" },
+  "column-2": { columnId: "column-2", order: "a1", width: 420 },
+});
+assert.equal(readTableColumnWidth(objectTable, "column-1"), null);
+assert.equal(totalTableColumnWidth([272, 528]), 800);
+assert.equal(totalTableColumnWidth([272, null]), null);
+
+for (const doc of [flatDoc, nestedDoc, objectDoc]) doc.destroy();
+
 const appendBlockSchema = toolSchema("append_block");
 const tableCell = { docId: "doc-1", type: "table", rows: 1, columns: 2 };
 const tableData = [["left", "right"]];
@@ -198,6 +271,85 @@ assert.equal(requestCount, 0, "invalid table cell input must not reach AFFiNE");
 assert.equal(toolSchema("list_docs").safeParse({ workspaceId: "w", first: 201 }).success, false);
 assert.equal(toolSchema("search_docs").safeParse({ query: "x", limit: -1 }).success, false);
 assert.equal(toolSchema("list_workspace_tree").safeParse({ depth: 21 }).success, false);
+
+const createDocDefinition = registry.tools.get("create_doc")?.definition;
+assert.match(createDocDefinition?.description ?? "", /plain-text content stored as one paragraph/);
+assert.match(createDocDefinition?.inputSchema?.content?.description ?? "", /structured Markdown/);
+assert.deepEqual(createDocContentWarnings("A plain paragraph."), []);
+assert.deepEqual(createDocContentWarnings("## Heading\n\n- List item"), [
+  "create_doc stores content as one plain paragraph; structured Markdown was detected. Use create_doc_from_markdown to preserve headings, lists, links, and code blocks.",
+]);
+for (const content of [
+  "| Name | Status |\n| --- | --- |\n| Task | Done |",
+  "Name | Status\n:--- | ---:\nTask | Done",
+  "| Name |\r\n| :---: |",
+  "| Name | Status |\n:--- | ---:",
+  "| Name | Status |\r| --- | --- |",
+  String.raw`| A \| B | C |` + "\n| --- | --- |",
+  "Read [the guide](https://example.com).",
+  "Read [link [foo]](/uri).",
+  "Read [outer [middle [inner]]](/uri).",
+  "Read [label\\]](url).",
+  "\\".repeat(2) + "[label](url)",
+  "[label](url\\))",
+  "![diagram](https://example.com/image.png)",
+  "First line.\r\n## Heading",
+  "> A quote",
+  "```ts\nconst value = 1;\n```",
+]) {
+  assert.equal(createDocContentWarnings(content).length, 1, `${content} should warn about Markdown`);
+}
+for (const content of [
+  undefined,
+  "",
+  "A | B\nordinary text",
+  "| A | B |\n| --- |",
+  "| A | B |\n| --- || --- |",
+  "A | B\n\n--- | ---",
+  "    | A | B |\n    | --- | --- |",
+  "\t| A | B |\n\t| --- | --- |",
+  String.raw`A \| B` + "\n--- | ---",
+  "[unclosed label",
+  "[label](unclosed",
+  "[label]()",
+  "[label\n](url)",
+  "[outer [inner]](unclosed",
+  "[outer [inner]\n](url)",
+  "\\" + "[label](url)",
+  "\\".repeat(3) + "[label](url)",
+  "[label\\](url)",
+  "[label](url\\)",
+]) {
+  assert.deepEqual(createDocContentWarnings(content), [], "literal or incomplete inline-link syntax should not warn");
+}
+
+// Run adversarial inputs in a killable child so a synchronous regression cannot
+// hang the fast suite. The former regex took quadratic time on both forms.
+const markdownDetectionRegression = spawnSync(process.execPath, [
+  "--input-type=module",
+  "-e",
+  `import assert from "node:assert/strict";
+   import { createDocContentWarnings } from ${JSON.stringify(new URL("../dist/tools/docs.js", import.meta.url).href)};
+   for (const content of ["[".repeat(1048576), "[label](".repeat(131072), "A | B\\n|" + "-".repeat(1048576) + "x|", ("A | B\\n--- | invalid\\n").repeat(32768)]) {
+     assert.deepEqual(createDocContentWarnings(content), []);
+   }`,
+], { encoding: "utf8", timeout: 5000 });
+assert.ifError(markdownDetectionRegression.error);
+assert.equal(
+  markdownDetectionRegression.status,
+  0,
+  `Markdown warning detection must complete for long unmatched delimiters: ${markdownDetectionRegression.stderr}`,
+);
+
+const createDocFromMarkdownDefinition = registry.tools.get("create_doc_from_markdown")?.definition;
+assert.match(createDocFromMarkdownDefinition?.description ?? "", /folderId/);
+const createDocFromMarkdownSchema = toolSchema("create_doc_from_markdown");
+const markdownWithFolder = createDocFromMarkdownSchema.safeParse({
+  markdown: "## Heading",
+  folderId: "folder-1",
+});
+assert.equal(markdownWithFolder.success, true, "create_doc_from_markdown must accept folderId");
+assert.equal(markdownWithFolder.data.folderId, "folder-1");
 assert.equal(toolSchema("list_comments").safeParse({ docId: "d", first: 1.5 }).success, false);
 assert.equal(toolSchema("list_notifications").safeParse({ offset: -1 }).success, false);
 assert.equal(toolSchema("list_histories").safeParse({ guid: "d", take: 0 }).success, false);
@@ -262,5 +414,27 @@ assert.equal(parseResult(await cleanupBlobs({
   confirmWorkspaceId: "workspace-1",
 })).success, true);
 assert.equal(requestCount, 3, "valid confirmations should reach AFFiNE exactly once each");
+
+// Named icons must keep `color` through the input schema and be written with
+// AFFiNE's `affine-icon` discriminator (its renderer ignores `icon`).
+for (const toolName of ["update_doc_icon", "update_folder_icon"]) {
+  const iconField = registry.tools.get(toolName)?.definition?.inputSchema?.icon;
+  assert.ok(iconField, `${toolName} must declare an icon input`);
+  assert.deepEqual(
+    iconField.parse({ type: "affine-icon", name: "FlagPanel", color: "#EB4C42" }),
+    { type: "affine-icon", name: "FlagPanel", color: "#EB4C42" },
+    `${toolName} must keep icon color`,
+  );
+  assert.equal(iconField.safeParse({ type: "blob", blob: {} }).success, false);
+}
+assert.deepEqual(
+  normalizeIconInput({ type: "icon", name: " FlagPanel ", color: " #EB4C42 " }),
+  { type: "affine-icon", name: "FlagPanel", color: "#EB4C42" },
+);
+assert.deepEqual(normalizeIconInput({ type: "affine-icon", name: "FlagPanel" }), { type: "affine-icon", name: "FlagPanel" });
+assert.deepEqual(normalizeIconInput({ type: "affine-icon", name: "FlagPanel", color: "  " }), { type: "affine-icon", name: "FlagPanel" });
+assert.deepEqual(normalizeIconInput("🧪"), { type: "emoji", unicode: "🧪" });
+assert.equal(normalizeIconInput(null), null);
+assert.throws(() => normalizeIconInput({ type: "affine-icon", name: "  " }), /non-empty `name`/);
 
 console.log("Input contract tests passed");

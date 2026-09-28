@@ -7,6 +7,7 @@ on:
 
 jobs:
   publish:
+    if: github.repository == 'DAWNCR0W/affine-mcp-server'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

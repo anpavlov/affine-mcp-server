@@ -44,7 +44,7 @@ Use when:
 Typical tool sequence:
 
 1. `search_docs` to find the parent
-2. `create_doc` or `create_doc_from_markdown`
+2. `create_doc` for one plain paragraph, or `create_doc_from_markdown` for formatted content; pass `folderId` to either tool for organize-folder placement
 3. `move_doc` if you created the doc before deciding its final parent
 4. `list_children` to verify placement
 
@@ -174,3 +174,5 @@ Typical tool sequence:
 Never reconstruct and replay previously approved operations after a stale/unknown/missing-patch result. Prepared patches are shared across MCP sessions in one server process for identical AFFiNE endpoint and backend credentials. They expire after 30 minutes and are lost on server restart; multiple replicas do not share them. Changing backend credentials requires a new prepare. Patches intentionally provide no strict compare-and-swap guarantee for a concurrent edit that lands between the final stale check and the push.
 
 To inspect older content, use `list_histories`, then `read_doc_revision` or `diff_doc_revision`. History reads do not fall back to the current document when a revision is missing or malformed.
+
+Patch apply joins the same process-local workspace write queue as upstream mutations, using the workspace stored with the patch. It rejects documents removed from workspace metadata even if AFFiNE retains their content snapshot. Successful application also updates the page modification date. A failure confirming content or timestamp delivery requires readback before preparing a new patch.

@@ -7,6 +7,13 @@ import {
   isRemotePlainHttpUrl,
   parseBooleanFlag,
 } from "./networkSecurity.js";
+import {
+  hasAuthenticationHeader,
+  resolveConfiguredAuth,
+  withoutAuthenticationHeaders,
+  type ConfiguredAuthKind,
+  type ConfiguredAuthSource,
+} from "./util/configuredAuth.js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json");
@@ -44,6 +51,8 @@ export type ServerConfig = {
   email?: string;
   password?: string;
   defaultWorkspaceId?: string;
+  authKind: ConfiguredAuthKind;
+  authSource: ConfiguredAuthSource;
   authMode: "bearer" | "oauth";
   publicBaseUrl?: string;
   oauthIssuerUrl?: string;
@@ -101,7 +110,7 @@ export function writeConfigFile(vars: Record<string, string>) {
   }
 }
 
-type BaseUrlValidationOptions = {
+export type BaseUrlValidationOptions = {
   allowInsecureHttp?: boolean;
   insecureHttpOptInName?: string;
   label?: string;
@@ -158,9 +167,20 @@ export function validateGraphqlPath(input: string): string {
   return `/${trimmed.replace(/^\/+/, "")}`.replace(/\/$/, "") || "/";
 }
 
-/** Build the exact GraphQL endpoint used by the CLI and runtime. */
-export function buildGraphqlEndpoint(baseUrl: string, graphqlPath: string): string {
-  return `${validateBaseUrl(baseUrl)}${validateGraphqlPath(graphqlPath)}`;
+/**
+ * Build the exact GraphQL endpoint used by the CLI and runtime.
+ *
+ * `options` must be forwarded from the caller that validated `baseUrl`: this
+ * helper re-validates the URL, so dropping the plain-HTTP opt-in here makes a
+ * granted `AFFINE_ALLOW_INSECURE_HTTP=true` opt-in fail with
+ * "must use HTTPS for non-loopback destinations".
+ */
+export function buildGraphqlEndpoint(
+  baseUrl: string,
+  graphqlPath: string,
+  options: BaseUrlValidationOptions = {},
+): string {
+  return `${validateBaseUrl(baseUrl, options)}${validateGraphqlPath(graphqlPath)}`;
 }
 
 /**
@@ -191,7 +211,7 @@ function parseHeadersJson(raw?: string): Record<string, string> | undefined {
     if (sensitiveKeys.length) {
       console.warn(
         `WARNING: AFFINE_HEADERS_JSON contains sensitive key(s): ${sensitiveKeys.join(", ")}. ` +
-        `Built-in token/cookie auth overrides these values when configured.`
+        `Authentication headers are normalized with explicit credential precedence.`
       );
     }
     return headers;
@@ -201,28 +221,12 @@ function parseHeadersJson(raw?: string): Record<string, string> | undefined {
   }
 }
 
-function removeHeadersCaseInsensitive(
-  headers: Record<string, string> | undefined,
-  names: string[],
-): Record<string, string> | undefined {
-  if (!headers) return undefined;
-  const blocked = new Set(names.map((name) => name.toLowerCase()));
-  const filtered = Object.fromEntries(
-    Object.entries(headers).filter(([name]) => !blocked.has(name.toLowerCase())),
-  );
-  return Object.keys(filtered).length > 0 ? filtered : undefined;
-}
-
 const AUTH_CREDENTIAL_VARIABLES = [
   "AFFINE_API_TOKEN",
   "AFFINE_COOKIE",
   "AFFINE_EMAIL",
   "AFFINE_PASSWORD",
 ] as const;
-
-function hasAuthenticationHeader(headers: Record<string, string> | undefined): boolean {
-  return Object.keys(headers || {}).some((name) => /^(authorization|cookie)$/i.test(name));
-}
 
 /**
  * Resolve authentication as one source-scoped group.
@@ -260,25 +264,23 @@ function resolveAuthenticationConfig(file: Record<string, string>) {
   }
 
   const credentials = environmentProvidesAuthentication ? process.env : file;
-
-  const apiToken = credentials.AFFINE_API_TOKEN || undefined;
-  const cookie = credentials.AFFINE_COOKIE || undefined;
-  const email = credentials.AFFINE_EMAIL || undefined;
-  const password = credentials.AFFINE_PASSWORD || undefined;
-
   if (environmentProvidesAuthentication && headersSource === "config") {
-    headers = removeHeadersCaseInsensitive(headers, ["authorization", "cookie"]);
+    headers = withoutAuthenticationHeaders(headers);
   }
-  if (apiToken) {
-    headers = removeHeadersCaseInsensitive(headers, ["authorization", "cookie"]);
-  } else if (cookie) {
-    headers = {
-      ...(removeHeadersCaseInsensitive(headers, ["authorization", "cookie"]) || {}),
-      Cookie: cookie,
-    };
-  }
+  const savedAuthenticationConfigured = AUTH_CREDENTIAL_VARIABLES.some((name) => Boolean(file[name]))
+    || (headersSource === "config" && hasAuthenticationHeader(headers));
+  const authSource: ConfiguredAuthSource = environmentProvidesAuthentication
+    ? "env"
+    : savedAuthenticationConfigured ? "config" : "unset";
 
-  return { apiToken, cookie, email, password, headers };
+  return resolveConfiguredAuth({
+    apiToken: credentials.AFFINE_API_TOKEN || undefined,
+    cookie: credentials.AFFINE_COOKIE || undefined,
+    email: credentials.AFFINE_EMAIL || undefined,
+    password: credentials.AFFINE_PASSWORD || undefined,
+    headers,
+    source: authSource,
+  });
 }
 
 function parseAuthMode(raw: string | undefined): "bearer" | "oauth" {
@@ -391,7 +393,15 @@ export function loadConfig(): ServerConfig {
     },
   );
   const authMode = parseAuthMode(env("AFFINE_MCP_AUTH_MODE", file, "bearer"));
-  const { apiToken, cookie, email, password, headers } = resolveAuthenticationConfig(file);
+  const {
+    apiToken,
+    cookie,
+    email,
+    password,
+    headers,
+    kind: authKind,
+    source: authSource,
+  } = resolveAuthenticationConfig(file);
   const graphqlPath = validateGraphqlPath(env("AFFINE_GRAPHQL_PATH", file, "/graphql")!);
   const graphqlEndpoint = `${baseUrl}${graphqlPath}`;
   const defaultWorkspaceId = env("AFFINE_WORKSPACE_ID", file);
@@ -438,6 +448,8 @@ export function loadConfig(): ServerConfig {
     email,
     password,
     defaultWorkspaceId,
+    authKind,
+    authSource,
     authMode,
     publicBaseUrl,
     oauthIssuerUrl,

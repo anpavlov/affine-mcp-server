@@ -7,6 +7,8 @@ import * as Y from "yjs";
 
 import { diffDocStates } from "../src/docDiff.ts";
 import { createDocPatchManager, createDocPatchStore, DocPatchError } from "../src/docPatches.ts";
+import { coordinateTool } from "../src/toolCoordination.ts";
+import { writeCoordinator } from "../src/util/writeCoordinator.ts";
 import { toolOutputSchemaFor } from "../src/toolOutputSchemas.ts";
 import { registerDocTools } from "../src/tools/docs.ts";
 
@@ -329,12 +331,15 @@ let sharedPushes = 0;
 async function patchSession(store = sharedStore, cookie = "account-a", endpoint = "https://affine.test/graphql") {
   const server = new McpServer({ name: "cross-session", version: "1" });
   const register = server.registerTool.bind(server);
-  server.registerTool = (name, options, handler) => register(name, {
-    ...options, outputSchema: toolOutputSchemaFor(name),
-  }, handler);
+  server.registerTool = (name, options, handler) => {
+    const coordinated = coordinateTool(name, options.inputSchema || {}, handler, {
+      endpoint, workspaceId: "different-default-workspace", gql: {},
+    });
+    return register(name, { ...options, inputSchema: coordinated.inputSchema, outputSchema: toolOutputSchemaFor(name) }, coordinated.handler);
+  };
   registerDocTools(server, {
     getConnectionAuth: async () => ({ endpoint, cookie }),
-  }, { workspaceId: "workspace" }, {
+  }, { workspaceId: "workspace" }, {}, {
     store,
     backend: {
       loadCurrent: async () => bytes(sharedDoc),
@@ -387,7 +392,53 @@ assert.match(JSON.stringify(discardedApply), /PATCH_DISCARDED/);
 assert.equal(sharedPushes, 1);
 await second.close();
 await third.close();
-sharedDoc.destroy();
 
 for (const doc of [currentDoc, applied, staleBase, concurrent, binaryBase, binaryLoaded, binarySame, binaryChanged, richBase, richChanged, deleteBase, deleteChanged, largeBinaryBase, largeBinaryChanged]) doc.destroy();
+// Apply must wait for an ordinary writer in the patch's stored workspace,
+// even when the applying session has a different default workspace.
+const coordinatedSession = await patchSession();
+const queuedPatch = payload(await coordinatedSession.client.callTool({ name: "prepare_doc_patch", arguments: {
+  workspaceId: "workspace", docId: "doc",
+  operations: [{ type: "replace_block_text", blockId: "p1", text: "queued patch" }],
+} }));
+assert.equal(queuedPatch.status, "prepared");
+let releaseWriter;
+const writerGate = new Promise(resolve => { releaseWriter = resolve; });
+let writerStarted;
+const started = new Promise(resolve => { writerStarted = resolve; });
+const ordinaryWriter = writeCoordinator.run(JSON.stringify(["https://affine.test", "workspace"]), async () => {
+  writerStarted();
+  await writerGate;
+  sharedDoc.getMap("blocks").get("p1").get("prop:text").insert(0, "concurrent edit ");
+});
+await started;
+const beforeQueuedApply = sharedPushes;
+const queuedApply = coordinatedSession.client.callTool({ name: "apply_doc_patch", arguments: { patchId: queuedPatch.patchId } });
+try {
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(sharedPushes, beforeQueuedApply, "apply escaped the stored workspace lock");
+} finally { releaseWriter(); }
+await ordinaryWriter;
+assert.equal(payload(await queuedApply).code, "PATCH_STALE");
+assert.equal(sharedPushes, beforeQueuedApply, "queued stale patch was published");
+const invalidReference = await coordinatedSession.client.callTool({ name: "prepare_doc_patch", arguments: {
+  docId: "doc", operations: [{ type: "replace_block_text", blockId: "p1", text: [
+    { insert: "visible label", attributes: { reference: { type: "LinkedPage", pageId: "linked" } } },
+  ] }],
+} });
+assert.equal(invalidReference.isError, true, "patches must preserve upstream LinkedPage validation");
+await coordinatedSession.close();
+sharedDoc.destroy();
+
+// History and live reads use the same projection without materializing legacy meta.
+const projectionServer = new McpServer({ name: "projection", version: "1" });
+const { projectReadDoc } = registerDocTools(projectionServer, {}, {});
+const projectedDoc = fixture();
+assert.equal(projectedDoc.share.has("meta"), false);
+const projected = projectReadDoc(projectedDoc, "doc", { includeMarkdown: true, workspaceTags: ["workspace-tag"] });
+assert.deepEqual(projected.tags, ["workspace-tag"]);
+assert.equal(projectedDoc.share.has("meta"), false, "read projection created non-canonical metadata");
+projectedDoc.destroy();
+await projectionServer.close();
+
 console.log("Verified document patch diff, immutable update, lifecycle, stale checks, and binary fingerprints.");

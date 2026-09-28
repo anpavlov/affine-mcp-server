@@ -20,7 +20,7 @@ function writeFixture(overrides = {}) {
       packages: { "": { version: overrides.lockPackageVersion || version } },
     }),
     "tool-manifest.json": JSON.stringify({ version: overrides.manifestVersion || version, tools: [] }),
-    "README.md": `[![Version](https://img.shields.io/badge/version-${overrides.badgeVersion || version}-blue)](#)`,
+    "README.md": `[![Version](https://img.shields.io/badge/version-${(overrides.badgeVersion || version).replace("-docpatch", "--docpatch")}-blue)](#)`,
     "CHANGELOG.md": `## [${overrides.changelogVersion || version}]\n[${overrides.changelogVersion || version}]: https://example.test/releases/tag/v${overrides.changelogTag || overrides.changelogVersion || version}${overrides.changelogExtra || ""}`,
     "RELEASE_NOTES.md": `## Version ${overrides.notesVersion || version}`,
   };
@@ -36,6 +36,12 @@ for (const tag of ["2.5.0", "v2.5", "v2.5.0-beta.1", "v02.5.0", "release-v2.5.0"
   assert.throws(() => versionFromReleaseTag(tag), /exact vX\.Y\.Z format/);
 }
 
+assert.equal(versionFromReleaseTag("v3.8.3-docpatch.1.0"), "3.8.3-docpatch.1.0");
+const forkRoot = writeFixture({ version: "3.8.3-docpatch.1.0" });
+assert.equal(validateReleaseMetadata(forkRoot, "v3.8.3-docpatch.1.0").version, "3.8.3-docpatch.1.0");
+for (const tag of ["v3.8.3-docpatch.01.0", "v3.8.3-docpatch.1", "v3.8.3-docpatch.1.0-extra"]) {
+  assert.throws(() => versionFromReleaseTag(tag));
+}
 const validRoot = writeFixture();
 assert.deepEqual(validateReleaseMetadata(validRoot, "v2.5.0"), {
   tag: "v2.5.0",

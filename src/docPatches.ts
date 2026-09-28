@@ -53,6 +53,7 @@ export type PatchManagerDependencies = {
   scope?: string;
   loadCurrent(workspaceId: string, docId: string): Promise<Uint8Array | null>;
   pushUpdate(workspaceId: string, docId: string, update: Uint8Array): Promise<void>;
+  coordinateApply?: <T>(workspaceId: string, operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
   now?: () => number;
   randomId?: () => string;
   ttlMs?: number;
@@ -233,7 +234,16 @@ export function createDocPatchManager(dependencies: PatchManagerDependencies) {
     }
   }
 
-  async function apply(patchId: string) {
+  async function apply(patchId: string, signal?: AbortSignal) {
+    const record = addressed(patchId);
+    if (!record) throw new DocPatchError("PATCH_NOT_FOUND", `Patch ${patchId} was not found.`);
+    if (dependencies.coordinateApply) {
+      return dependencies.coordinateApply(record.workspaceId, () => applyPrepared(patchId), signal);
+    }
+    return applyPrepared(patchId);
+  }
+
+  async function applyPrepared(patchId: string) {
     const record = addressed(patchId);
     if (!record) throw new DocPatchError("PATCH_NOT_FOUND", `Patch ${patchId} was not found.`);
     if (record.status !== "prepared") terminalError(record);

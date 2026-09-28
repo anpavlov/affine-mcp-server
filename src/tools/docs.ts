@@ -1,15 +1,20 @@
 import { isDeepStrictEqual } from "node:util";
 import { createHash } from "node:crypto";
 
+import { registerMindmapTools } from "./mindmap.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { generateKeyBetween, generateNKeysBetween } from "fractional-indexing";
 import { GraphQLClient } from "../graphqlClient.js";
-import { receipt, text, toolError } from "../util/mcp.js";
+import { receipt, text, toolError, ToolFailure } from "../util/mcp.js";
 import {
   type DocumentMoveOutcome,
+  type DocumentCreationErrorInput,
+  DocumentCreationError,
   executeSafeDocumentMove,
   handleMarkdownOperationFailure,
+  isDocumentCreationError,
+  toDocumentCreationResult,
   toDocumentMoveResult,
 } from "../util/mutationSafety.js";
 import {
@@ -26,23 +31,32 @@ import {
   requireMatchingConfirmation,
 } from "../util/inputSchemas.js";
 import { secureAffineId, secureRandomInt31 } from "../util/random.js";
+import { writeCoordinator, WriteCoordinatorError } from "../util/writeCoordinator.js";
+import { documentRevision, isDocumentRegistered } from "../util/documentRevision.js";
 import {
   wsUrlFromGraphQLEndpoint,
   connectWorkspaceSocket,
   joinWorkspace,
   loadDoc,
   pushDocUpdate,
+  pushPageDocUpdate,
   deleteDoc as wsDeleteDoc,
   type WorkspaceSocket,
 } from "../ws.js";
 import * as Y from "yjs";
 import { parseMarkdownToOperations } from "../markdown/parse.js";
 import { renderBlocksToMarkdown } from "../markdown/render.js";
-import { richTextValueToDeltas, richTextValueToString } from "../markdown/richText.js";
+import {
+  AFFINE_LINKED_PAGE_REFERENCE_NODE,
+  normalizeLinkedPageReferenceDeltas,
+  richTextValueToDeltas,
+  richTextValueToString,
+} from "../markdown/richText.js";
 import { buildMarkdownFrontmatter } from "../markdown/safety.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
 import { addOrganizeLinkToFolder } from "./organize.js";
 import { createDocPatchManager, createDocPatchStore, DocPatchError, type DocPatchStore, type PatchManagerDependencies } from "../docPatches.js";
+import { ALL_TOOLS } from "../toolSurface.js";
 import {
   type Bound,
   DEFAULT_NOTE_XYWH,
@@ -183,6 +197,28 @@ export function buildWorkspaceListDocsFallbackConnection(
   };
 }
 
+/** Filter acknowledged deletions without discarding the backend page cursor. */
+export function filterWorkspaceListDocsConnection(
+  connection: WorkspaceListDocsConnection,
+  excludedDocIds: ReadonlySet<string>,
+): WorkspaceListDocsConnection {
+  const rawEdges = connection.edges;
+  const edges = excludedDocIds.size === 0
+    ? rawEdges
+    : rawEdges.filter((edge) => {
+        const nodeId = edge?.node?.id;
+        return typeof nodeId !== "string" || !excludedDocIds.has(nodeId);
+      });
+  return {
+    ...connection,
+    edges,
+    pageInfo: {
+      ...connection.pageInfo,
+      endCursor: connection.pageInfo.endCursor ?? rawEdges.at(-1)?.cursor ?? null,
+    },
+  };
+}
+
 export async function requestListDocsWithPublicFallback(
   gql: Pick<GraphQLClient, "request">,
   variables: ListDocsVariables,
@@ -244,6 +280,34 @@ export function documentMoveToolResult(
   return receipt("doc.move", {
     ...context,
     ...outcomeData,
+  });
+}
+
+/** Keep the generated document id and recovery state in every creation error. */
+export function documentCreationToolResult(error: unknown, kind: string) {
+  if (!isDocumentCreationError(error)) {
+    return null;
+  }
+  const result = toDocumentCreationResult(error);
+  const { ok, error: message, code, retryable, ...failureData } = result;
+  return toolError(message, {
+    code,
+    retryable,
+    data: { kind, ...failureData },
+  });
+}
+
+/** Preserve an id when a post-skeleton materialization step cannot be confirmed. */
+function documentCreationMaterializationError(
+  context: Pick<DocumentCreationErrorInput, "workspaceId" | "docId" | "title">,
+  cause: unknown,
+): DocumentCreationError {
+  return new DocumentCreationError({
+    ...context,
+    stage: "content",
+    contentPersisted: null,
+    metadataPersisted: true,
+    cause,
   });
 }
 
@@ -337,11 +401,18 @@ export function removeEmbeddedLinkedDocumentBlocks(
   return matchingBlockIds.size;
 }
 
+export function parentLinkWarningOrThrow(error: unknown, warning: string): string {
+  if (error instanceof ToolFailure && error.code === "workspace_page_updated_date_failed") {
+    throw error;
+  }
+  return warning;
+}
+
 const WorkspaceId = z.string().min(1, "workspaceId required").describe("AFFiNE workspace id. Omit only when AFFINE_WORKSPACE_ID is configured.");
 const DocId = z.string().min(1, "docId required").describe("AFFiNE document id.");
 const TextDeltaInput = z.object({
-  insert: z.string(),
-  attributes: z.record(z.unknown()).optional(),
+  insert: z.string().describe('Text to insert. For a LinkedPage reference, use one ASCII space per reference (insert: " ").'),
+  attributes: z.record(z.unknown()).optional().describe('Inline attributes. For a LinkedPage reference, use { reference: { type: "LinkedPage", pageId: "<docId>" } }; AFFiNE resolves the page label from pageId.'),
 });
 const RichTextInput = z.union([z.string(), z.array(TextDeltaInput)]);
 const PatchId = z.string().regex(/^dp_[0-9a-f]{32}$/);
@@ -392,7 +463,7 @@ export const PrepareDocPatchInput = z.object({
 }).strict();
 export const ApplyDocPatchInput = z.object({ patchId: PatchId }).strict();
 export const DiscardDocPatchInput = ApplyDocPatchInput;
-const MarkdownContent = z.string().min(1, "markdown required").describe("Markdown content to import, append, replace, or export-roundtrip.");
+const MarkdownContent = z.string().min(1, "markdown required").describe('Markdown content to import, append, replace, or export-roundtrip. Inline page references use [label](LinkedPage:<docId>) and import as native AFFiNE reference nodes.');
 const TagName = z.string().trim().min(1, "tag required").describe("Workspace tag name.");
 const TagIdOrName = z.string().trim().min(1, "tag required").describe("Workspace tag id or tag name.");
 const PageSize = BoundedPageSize.describe("Maximum number of items to return from the AFFiNE pagination connection (1-200).");
@@ -591,6 +662,105 @@ type UpdateTableCellInput = {
   column: number;
   text: string | TextDelta[];
 };
+
+type UpdateTableColumnWidthsInput = {
+  workspaceId?: string;
+  docId: string;
+  blockId: string;
+  widths: Array<number | null>;
+};
+
+export const TABLE_COLUMN_MIN_WIDTH = 60;
+export const TABLE_COLUMN_MAX_WIDTH = 4096;
+
+/** Narrow unknown JSON values to plain records without matching Yjs shared types. */
+function isPlainObjectRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** Sum explicit table widths, or return null while any column uses automatic sizing. */
+export function totalTableColumnWidth(
+  widths: Array<number | null>,
+): number | null {
+  return widths.every(width => width !== null)
+    ? widths.reduce((sum, width) => sum + (width ?? 0), 0)
+    : null;
+}
+
+/** Read a native table width without changing its nested, object, or flat storage shape. */
+export function readTableColumnWidth(
+  block: Y.Map<any>,
+  columnId: string,
+): number | null {
+  const columns = block.get("prop:columns");
+  if (columns instanceof Y.Map) {
+    const column = columns.get(columnId);
+    const width = column instanceof Y.Map
+      ? column.get("width")
+      : column && typeof column === "object"
+        ? (column as Record<string, unknown>).width
+        : undefined;
+    return typeof width === "number" && Number.isFinite(width) ? width : null;
+  }
+
+  if (isPlainObjectRecord(columns)) {
+    const column = columns[columnId];
+    const width = isPlainObjectRecord(column)
+      ? column.width
+      : undefined;
+    return typeof width === "number" && Number.isFinite(width) ? width : null;
+  }
+
+  const width = block.get(`prop:columns.${columnId}.width`);
+  return typeof width === "number" && Number.isFinite(width) ? width : null;
+}
+
+/** Write a native table width while preserving the column container's storage shape. */
+export function writeTableColumnWidth(
+  block: Y.Map<any>,
+  columnId: string,
+  width: number | null,
+): void {
+  const columns = block.get("prop:columns");
+  if (columns instanceof Y.Map) {
+    const column = columns.get(columnId);
+    if (column instanceof Y.Map) {
+      if (width === null) column.delete("width");
+      else column.set("width", width);
+      return;
+    }
+    if (column && typeof column === "object") {
+      const next = { ...(column as Record<string, unknown>) };
+      if (width === null) delete next.width;
+      else next.width = width;
+      columns.set(columnId, next);
+      return;
+    }
+    throw new Error(`Table column '${columnId}' has an unsupported storage shape.`);
+  }
+
+  if (isPlainObjectRecord(columns)) {
+    const currentColumns = columns;
+    const column = currentColumns[columnId];
+    if (!isPlainObjectRecord(column)) {
+      throw new Error(`Table column '${columnId}' has an unsupported storage shape.`);
+    }
+    const nextColumn = { ...column };
+    if (width === null) delete nextColumn.width;
+    else nextColumn.width = width;
+    block.set("prop:columns", {
+      ...currentColumns,
+      [columnId]: nextColumn,
+    });
+    return;
+  }
+
+  const key = `prop:columns.${columnId}.width`;
+  if (width === null) block.delete(key);
+  else block.set(key, width);
+}
 
 type NormalizedAppendBlockInput = {
   workspaceId?: string;
@@ -1036,11 +1206,119 @@ export function createAcknowledgedDeletedDocTracker({
   };
 }
 
-export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults: { workspaceId?: string }, patchOptions: {
-  store?: DocPatchStore;
-  backend?: Pick<PatchManagerDependencies, "loadCurrent" | "pushUpdate">;
-} = {}) {
+type DocumentCreationTransport = {
+  connectWorkspaceSocket?: typeof connectWorkspaceSocket;
+  joinWorkspace?: typeof joinWorkspace;
+  loadDoc?: typeof loadDoc;
+  pushDocUpdate?: typeof pushDocUpdate;
+};
+
+type DocumentToolSurface = {
+  profile: string;
+  enabledTools: readonly string[];
+};
+
+type DocumentToolDefaults = {
+  workspaceId?: string;
+  toolSurface?: DocumentToolSurface;
+};
+
+function affineBaseUrl(endpoint: string, configuredBaseUrl?: string): string {
+  const explicitBaseUrl = configuredBaseUrl?.trim() || process.env.AFFINE_BASE_URL?.trim();
+  return (explicitBaseUrl || new URL(endpoint).origin).replace(/\/+$/, "");
+}
+
+function requireWorkspaceRootSnapshot(workspaceId: string, snapshot: { missing?: string }): string {
+  if (typeof snapshot.missing !== "string") {
+    throw new ToolFailure(
+      `Workspace root document is unavailable for workspace ${workspaceId}.`,
+      "workspace_root_unavailable",
+    );
+  }
+  return snapshot.missing;
+}
+
+/** Detect inline-link syntax in one pass without retrying unmatched openers. */
+function hasInlineMarkdownLink(content: string): boolean {
+  const labelOpeners: number[] = [];
+  let destinationStart = -1;
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    if (char === "\n" || char === "\r") {
+      labelOpeners.length = 0;
+      destinationStart = -1;
+      continue;
+    }
+    // Consume escape pairs once; odd backslash runs escape the next delimiter.
+    if (char === "\\") {
+      if (content[index + 1] !== "\n" && content[index + 1] !== "\r") index += 1;
+      continue;
+    }
+    if (destinationStart >= 0) {
+      if (char === ")") {
+        if (index > destinationStart) return true;
+        destinationStart = -1;
+      }
+      continue;
+    }
+    if (char === "[") {
+      labelOpeners.push(index);
+    } else if (char === "]") {
+      const labelStart = labelOpeners.pop();
+      if (labelStart !== undefined && index > labelStart + 1 && content[index + 1] === "(") {
+        destinationStart = index + 2;
+        index += 1;
+      }
+    }
+  }
+  return false;
+}
+
+/** Detect adjacent table headers and delimiter rows in linear time. */
+function hasMarkdownTable(content: string): boolean {
+  const lines = content.split(/\r\n?|\n/);
+  const indentedCode = /^(?: {4}| {0,3}\t)/;
+  for (let index = 1; index < lines.length; index += 1) {
+    const header = lines[index - 1];
+    const delimiter = lines[index];
+    if (!header.includes("|") || indentedCode.test(header) || indentedCode.test(delimiter)) continue;
+    const alignments = delimiter.trim().split("|");
+    if (alignments[0] === "") alignments.shift();
+    if (alignments[alignments.length - 1] === "") alignments.pop();
+    if (!alignments.length || !alignments.every(cell => /^:?-+:?$/.test(cell.trim()))) continue;
+    // Match markdown-it's escaped pipe handling without parsing inline content.
+    const columns = header.trim().split(/(?<!\\)\|/);
+    if (columns[0] === "") columns.shift();
+    if (columns[columns.length - 1] === "") columns.pop();
+    if (columns.length === alignments.length) return true;
+  }
+  return false;
+}
+
+/** Warn about structured Markdown while preserving create_doc's plain-text behavior. */
+export function createDocContentWarnings(content: string | undefined): string[] {
+  if (!content) return [];
+  const blockMarkdown = /^[ \t]{0,3}(?:#{1,6}[ \t]+|(?:[-+*]|\d+[.)])[ \t]+|>[ \t]+|`{3,}|~{3,})/m;
+  if (!blockMarkdown.test(content) && !hasInlineMarkdownLink(content) && !hasMarkdownTable(content)) return [];
+  return [
+    "create_doc stores content as one plain paragraph; structured Markdown was detected. Use create_doc_from_markdown to preserve headings, lists, links, and code blocks.",
+  ];
+}
+
+/** Register document tools with shared creation transport and folder-placement behavior. */
+export function registerDocTools(
+  server: McpServer,
+  gql: GraphQLClient,
+  defaults: DocumentToolDefaults,
+  documentCreationTransport: DocumentCreationTransport = {},
+  patchOptions: { store?: DocPatchStore; backend?: Pick<PatchManagerDependencies, "loadCurrent" | "pushUpdate"> } = {},
+) {
+  registerMindmapTools(server, gql, defaults, { getSurfaceElementsValueMap, buildSurfaceElementData, writeSurfaceElement, nextSurfaceElementIndex });
   const acknowledgedDeletedDocs = createAcknowledgedDeletedDocTracker();
+  const connectForDocumentCreation = documentCreationTransport.connectWorkspaceSocket ?? connectWorkspaceSocket;
+  const joinForDocumentCreation = documentCreationTransport.joinWorkspace ?? joinWorkspace;
+  const loadForDocumentCreation = documentCreationTransport.loadDoc ?? loadDoc;
+  const pushForDocumentCreation = documentCreationTransport.pushDocUpdate ?? pushDocUpdate;
 
   // helpers
   const generateId = secureAffineId;
@@ -1064,7 +1342,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       return yText;
     }
     let offset = 0;
-    for (const delta of content) {
+    for (const delta of normalizeLinkedPageReferenceDeltas(content)) {
       if (!delta.insert) {
         continue;
       }
@@ -1084,7 +1362,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
 
     let offset = 0;
-    for (const delta of content) {
+    for (const delta of normalizeLinkedPageReferenceDeltas(content)) {
       if (!delta.insert) continue;
       const attributes = isHeader
         ? { ...(delta.attributes ?? {}), bold: true }
@@ -1107,20 +1385,20 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   }
 
   /**
-   * Build a Y.Text containing a LinkedPage reference delta.
+   * Build a Y.Text containing a LinkedPage reference delta with AFFiNE's native sentinel.
    * This is the mechanism AFFiNE uses to associate a database row with a
    * linked doc that opens in "center peek" when the row title is clicked.
    */
   function makeLinkedDocText(docId: string): Y.Text {
     const delta: TextDelta[] = [
-      { insert: "\u200B", attributes: { reference: { type: "LinkedPage", pageId: docId } } },
+      { insert: AFFINE_LINKED_PAGE_REFERENCE_NODE, attributes: { reference: { type: "LinkedPage", pageId: docId } } },
     ];
     return makeText(delta);
   }
 
   /**
    * Extract inline LinkedPage reference IDs from a Y.Text value. AFFiNE stores
-   * @-mentions as zero-width text deltas whose page id lives in attributes.
+   * references as sentinel text deltas whose page id lives in attributes.
    */
   function extractLinkedPageRefs(propText: unknown): string[] {
     if (!(propText instanceof Y.Text)) return [];
@@ -1210,6 +1488,19 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       return null;
     }
     return value as Y.Array<string>;
+  }
+
+  function getExistingRootMap(doc: Y.Doc, key: string): Y.Map<any> | null {
+    const value = doc.share.get(key);
+    return value instanceof Y.Map ? value : null;
+  }
+
+  function getDocumentTagValues(doc: Y.Doc, workspaceTags?: readonly string[]): string[] {
+    if (workspaceTags !== undefined) {
+      return [...workspaceTags];
+    }
+    const legacyMeta = getExistingRootMap(doc, "meta");
+    return getStringArray(legacyMeta ? getTagArray(legacyMeta) : null);
   }
 
   function ensureTagArray(target: Y.Map<any>, key: string = "tags"): Y.Array<string> {
@@ -3102,7 +3393,17 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const { blockId, flavour, blockType } = insertBlockIntoDoc(doc, normalized);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, normalized.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(socket, workspaceId, normalized.docId, Buffer.from(delta).toString("base64"));
+
+      // Creating an empty table is supported, but nothing on the result said the
+      // cells were empty, so a caller that meant to pass cell content had no
+      // signal. Name the three ways to fill it rather than rejecting the call.
+      const warnings: string[] = [];
+      if (normalized.type === "table" && !normalized.tableData && !normalized.tableCellDeltas) {
+        warnings.push(
+          `Table ${blockId} was created with no cell content. Pass tableData or tableCellDeltas on append_block to fill it, or use update_table_cell to set cells afterwards.`,
+        );
+      }
 
       return {
         appended: true,
@@ -3113,6 +3414,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         legacyType: normalized.legacyType || null,
         ownedIds: normalized._frameOwnedIds,
         missing: normalized._frameMissing,
+        ...(warnings.length ? { warnings } : {}),
       };
     } finally {
       socket.disconnect();
@@ -3283,6 +3585,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     tableCellDeltas: TextDelta[][][];
     rowIds: string[];
     columnIds: string[];
+    columnWidths: Array<number | null>;
   } | null {
     const compareOrder = (left: string, right: string) => {
       if (left < right) return -1;
@@ -3315,6 +3618,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           typeof mapField(payload, "order") === "string"
             ? mapField(payload, "order") as string
             : columnId,
+        width: readTableColumnWidth(block, columnId),
       }))
       .sort((a, b) => compareOrder(a.order, b.order));
 
@@ -3355,7 +3659,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           .map(([rowId, order]) => ({ rowId, order }))
           .sort((a, b) => compareOrder(a.order, b.order));
         columnEntries = Array.from(flatColumns.entries())
-          .map(([columnId, order]) => ({ columnId, order }))
+          .map(([columnId, order]) => ({
+            columnId,
+            order,
+            width: readTableColumnWidth(block, columnId),
+          }))
           .sort((a, b) => compareOrder(a.order, b.order));
         cells = flatCells;
       }
@@ -3409,6 +3717,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       tableCellDeltas,
       rowIds: rowEntries.map(({ rowId }) => rowId),
       columnIds: columnEntries.map(({ columnId }) => columnId),
+      columnWidths: columnEntries.map(({ width }) => width),
     };
   }
 
@@ -3442,15 +3751,15 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   function collectDocForMarkdown(
     doc: Y.Doc,
-    tagOptionsById: Map<string, WorkspaceTagOption> = new Map()
+    tagOptionsById: Map<string, WorkspaceTagOption> = new Map(),
+    workspaceTags?: readonly string[],
   ): {
     title: string;
     tags: string[];
     rootBlockIds: string[];
     blocksById: Map<string, MarkdownRenderableBlock>;
   } {
-    const meta = doc.getMap("meta");
-    const tags = resolveTagLabels(getStringArray(getTagArray(meta)), tagOptionsById);
+    const tags = resolveTagLabels(getDocumentTagValues(doc, workspaceTags), tagOptionsById);
 
     const blocks = doc.getMap("blocks") as Y.Map<any>;
     const pageId = findBlockIdByFlavour(blocks, "affine:page");
@@ -3568,8 +3877,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     return rows;
   }
 
-  function summarizeDocFidelity(doc: Y.Doc, tagOptionsById: Map<string, WorkspaceTagOption> = new Map()) {
-    const collected = collectDocForMarkdown(doc, tagOptionsById);
+  function summarizeDocFidelity(
+    doc: Y.Doc,
+    tagOptionsById: Map<string, WorkspaceTagOption> = new Map(),
+    workspaceTags?: readonly string[],
+  ) {
+    const collected = collectDocForMarkdown(doc, tagOptionsById, workspaceTags);
     const rendered = renderBlocksToMarkdown({
       rootBlockIds: collected.rootBlockIds,
       blocksById: collected.blocksById,
@@ -3867,7 +4180,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     tagLabels: string[],
     supportIssues: NativeTemplateSupportIssue[]
   ): NativeTemplateStructureSummary {
-    const meta = doc.getMap("meta");
     const blocks = doc.getMap("blocks") as Y.Map<any>;
     const pageId = findBlockIdByFlavour(blocks, "affine:page");
     const surfaceId = findBlockIdByFlavour(blocks, "affine:surface");
@@ -3925,7 +4237,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       visit(String(id));
     }
 
-    const title = asText(meta.get("title")) || "Untitled";
+    const pageBlock = pageId ? findBlockById(blocks, pageId) : null;
+    const legacyMeta = getExistingRootMap(doc, "meta");
+    const legacyTitle = legacyMeta ? asText(legacyMeta.get("title")) : "";
+    const title = pageBlock
+      ? asText(pageBlock.get("prop:title")) || legacyTitle || "Untitled"
+      : legacyTitle || "Untitled";
 
     return {
       workspaceId,
@@ -4055,7 +4372,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, parsed.workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(socket, parsed.workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       return {
         appendedCount: blockIds.length,
@@ -4075,7 +4392,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     strict: boolean,
   ): void {
     const validationDocId = "markdown-preflight";
-    const skeleton = createDocSkeleton("Markdown preflight", validationDocId);
+    const skeleton = createDocSkeleton("Markdown preflight");
     let placement: AppendPlacement = { parentId: skeleton.noteId };
 
     for (const [operationIndex, operation] of operations.entries()) {
@@ -4116,93 +4433,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    const socket = await connectForDocumentCreation(wsUrl, cookie, bearer);
     try {
-      await joinWorkspace(socket, workspaceId);
+      await joinForDocumentCreation(socket, workspaceId);
 
       const docId = generateId();
       const title = parsed.title || "Untitled";
-      const ydoc = new Y.Doc();
-      const blocks = ydoc.getMap("blocks");
-      const pageId = generateId();
-      const page = new Y.Map();
-      setSysFields(page, pageId, "affine:page");
-      const titleText = new Y.Text();
-      titleText.insert(0, title);
-      page.set("prop:title", titleText);
-      const children = new Y.Array();
-      page.set("sys:children", children);
-      blocks.set(pageId, page);
-
-      const surfaceId = generateId();
-      const surface = new Y.Map();
-      setSysFields(surface, surfaceId, "affine:surface");
-      surface.set("sys:parent", null);
-      surface.set("sys:children", new Y.Array());
-      const elements = new Y.Map<any>();
-      elements.set("type", "$blocksuite:internal:native$");
-      elements.set("value", new Y.Map<any>());
-      surface.set("prop:elements", elements);
-      blocks.set(surfaceId, surface);
-      children.push([surfaceId]);
-
-      const noteId = generateId();
-      const note = new Y.Map();
-      setSysFields(note, noteId, "affine:note");
-      note.set("sys:parent", null);
-      note.set("prop:displayMode", "both");
-      note.set("prop:xywh", DEFAULT_NOTE_XYWH);
-      note.set("prop:index", "a0");
-      note.set("prop:hidden", false);
-      note.set("prop:background", buildDefaultNoteBackground());
-      const noteChildren = new Y.Array();
-      note.set("sys:children", noteChildren);
-      blocks.set(noteId, note);
-      children.push([noteId]);
-
-      const paraId = generateId();
-      const para = new Y.Map();
-      setSysFields(para, paraId, "affine:paragraph");
-      para.set("sys:parent", null);
-      para.set("sys:children", new Y.Array());
-      para.set("prop:type", "text");
-      const paragraphText = new Y.Text();
-      if (parsed.content) paragraphText.insert(0, parsed.content);
-      para.set("prop:text", paragraphText);
-      blocks.set(paraId, para);
-      noteChildren.push([paraId]);
-
-      const meta = ydoc.getMap("meta");
-      meta.set("id", docId);
-      meta.set("title", title);
-      meta.set("createDate", Date.now());
-      meta.set("tags", new Y.Array());
-
-      const updateFull = Y.encodeStateAsUpdate(ydoc);
-      const updateBase64 = Buffer.from(updateFull).toString("base64");
-      await pushDocUpdate(socket, workspaceId, docId, updateBase64);
-
-      const wsDoc = new Y.Doc();
-      const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-      if (snapshot.missing) {
-        Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
-      }
-      const prevSV = Y.encodeStateVector(wsDoc);
-      const wsMeta = wsDoc.getMap("meta");
-      let pages = wsMeta.get("pages") as Y.Array<Y.Map<any>> | undefined;
-      if (!pages) {
-        pages = new Y.Array();
-        wsMeta.set("pages", pages);
-      }
-      const entry = new Y.Map();
-      entry.set("id", docId);
-      entry.set("title", title);
-      entry.set("createDate", Date.now());
-      entry.set("tags", new Y.Array());
-      pages.push([entry as any]);
-      const wsDelta = Y.encodeStateAsUpdate(wsDoc, prevSV);
-      const wsDeltaBase64 = Buffer.from(wsDelta).toString("base64");
-      await pushDocUpdate(socket, workspaceId, workspaceId, wsDeltaBase64);
+      const docShell = createDocSkeleton(title, parsed.content);
+      await commitNewDocument(socket, workspaceId, docId, title, docShell.doc);
 
       return {
         workspaceId,
@@ -4282,11 +4520,15 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           pageId: parsed.docId,
         });
         return { parentDocId, linkedToParent: true, warnings: [] };
-      } catch {
+      } catch (error) {
+        const warning = parentLinkWarningOrThrow(
+          error,
+          `${parsed.context}: doc created but could not be linked to parent doc "${parentDocId}". Link it manually.`,
+        );
         return {
           parentDocId,
           linkedToParent: false,
-          warnings: [`${parsed.context}: doc created but could not be linked to parent doc "${parentDocId}". Link it manually.`],
+          warnings: [warning],
         };
       }
     } finally {
@@ -4294,7 +4536,55 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
-  function createDocSkeleton(title: string, docId: string): {
+  /** Link a created document into its folder, preserving creation success with warnings on failure. */
+  async function finalizeDocFolderPlacement(parsed: {
+    workspaceId: string;
+    docId: string;
+    folderId?: string;
+  }): Promise<{
+    folderId: string | null;
+    folderLinked: boolean;
+    folderNodeId: string | null;
+    warnings: string[];
+  }> {
+    const folderId = parsed.folderId?.trim();
+    if (!folderId) {
+      return { folderId: null, folderLinked: false, folderNodeId: null, warnings: [] };
+    }
+
+    let socket: WorkspaceSocket | undefined;
+    try {
+      const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+      socket = await connectWorkspaceSocket(
+        wsUrlFromGraphQLEndpoint(endpoint),
+        cookie,
+        bearer,
+      );
+      await joinWorkspace(socket, parsed.workspaceId);
+      const link = await addOrganizeLinkToFolder(socket, parsed.workspaceId, {
+        folderId,
+        type: "doc",
+        targetId: parsed.docId,
+      });
+      return {
+        folderId: link.parentId,
+        folderLinked: true,
+        folderNodeId: link.id,
+        warnings: [],
+      };
+    } catch (err: any) {
+      return {
+        folderId: null,
+        folderLinked: false,
+        folderNodeId: null,
+        warnings: [`Doc created but could not be placed in folder "${folderId}": ${err?.message ?? "unknown error"}`],
+      };
+    } finally {
+      socket?.disconnect();
+    }
+  }
+
+  function createDocSkeleton(title: string, content = ""): {
     doc: Y.Doc;
     blocks: Y.Map<any>;
     pageId: string;
@@ -4344,24 +4634,20 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     skeletonPara.set("sys:parent", null);
     skeletonPara.set("sys:children", new Y.Array());
     skeletonPara.set("prop:type", "text");
-    skeletonPara.set("prop:text", new Y.Text());
+    skeletonPara.set("prop:text", makeText(content));
     blocks.set(skeletonParaId, skeletonPara);
     skeletonNoteChildren.push([skeletonParaId]);
-
-    const meta = doc.getMap("meta");
-    meta.set("id", docId);
-    meta.set("title", title);
-    meta.set("createDate", Date.now());
-    meta.set("tags", new Y.Array());
 
     return { doc, blocks, pageId, surfaceId, noteId };
   }
 
   function makeWorkspacePageEntry(docId: string, title: string): Y.Map<any> {
     const entry = new Y.Map();
+    const createdAt = Date.now();
     entry.set("id", docId);
     entry.set("title", title);
-    entry.set("createDate", Date.now());
+    entry.set("createDate", createdAt);
+    entry.set("updatedDate", createdAt);
     entry.set("tags", new Y.Array());
     return entry;
   }
@@ -4541,31 +4827,220 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     throw new Error(`Section heading '${sectionTitle}' was not found.`);
   }
 
-  async function commitNewDocument(
+  type DocumentCreationProbe = Pick<
+    DocumentCreationErrorInput,
+    "contentPersisted" | "metadataPersisted"
+  >;
+
+  async function probeDocumentCreation(
+    socket: any,
+    workspaceId: string,
+    docId: string,
+  ): Promise<DocumentCreationProbe> {
+    let contentPersisted: DocumentCreationProbe["contentPersisted"] = null;
+    let metadataPersisted: DocumentCreationProbe["metadataPersisted"] = null;
+
+    try {
+      const contentSnapshot = await loadForDocumentCreation(socket, workspaceId, docId);
+      contentPersisted = typeof contentSnapshot.missing === "string"
+        || typeof contentSnapshot.state === "string";
+    } catch {
+      // A failed read cannot distinguish a missing document from an accepted
+      // write whose readback is temporarily unavailable.
+    }
+
+    try {
+      const workspaceSnapshot = await loadForDocumentCreation(socket, workspaceId, workspaceId);
+      if (typeof workspaceSnapshot.missing !== "string") {
+        metadataPersisted = false;
+      } else {
+        const workspaceDoc = new Y.Doc();
+        Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
+        metadataPersisted = getWorkspacePageEntries(workspaceDoc.getMap("meta"))
+          .some(page => page.id === docId);
+      }
+    } catch {
+      metadataPersisted = null;
+    }
+
+    return { contentPersisted, metadataPersisted };
+  }
+
+  async function buildWorkspacePageMetadataUpdate(
     socket: any,
     workspaceId: string,
     docId: string,
     title: string,
-    doc: Y.Doc
-  ) {
-    const updateFull = Y.encodeStateAsUpdate(doc);
-    await pushDocUpdate(socket, workspaceId, docId, Buffer.from(updateFull).toString("base64"));
-
-    const wsDoc = new Y.Doc();
-    const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-    if (snapshot.missing) {
-      Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+  ): Promise<string | null> {
+    const snapshotBase64 = (await loadForDocumentCreation(socket, workspaceId, workspaceId)).missing;
+    if (typeof snapshotBase64 !== "string") {
+      throw new Error(`Workspace metadata document ${workspaceId} was not found.`);
     }
-    const prevSV = Y.encodeStateVector(wsDoc);
-    const wsMeta = wsDoc.getMap("meta");
+
+    const workspaceDoc = new Y.Doc();
+    Y.applyUpdate(workspaceDoc, Buffer.from(snapshotBase64, "base64"));
+    const wsMeta = workspaceDoc.getMap("meta");
+    if (getWorkspacePageEntries(wsMeta).some(page => page.id === docId)) {
+      return null;
+    }
+
+    const prevSV = Y.encodeStateVector(workspaceDoc);
     let pages = wsMeta.get("pages") as Y.Array<Y.Map<any>> | undefined;
     if (!pages) {
       pages = new Y.Array();
       wsMeta.set("pages", pages);
     }
     pages.push([makeWorkspacePageEntry(docId, title)]);
-    const wsDelta = Y.encodeStateAsUpdate(wsDoc, prevSV);
-    await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(wsDelta).toString("base64"));
+    const wsDelta = Y.encodeStateAsUpdate(workspaceDoc, prevSV);
+    return Buffer.from(wsDelta).toString("base64");
+  }
+
+  async function ensureWorkspacePageMetadata(
+    socket: any,
+    workspaceId: string,
+    docId: string,
+    title: string,
+    metadataUpdateBase64?: string,
+  ): Promise<void> {
+    if (metadataUpdateBase64) {
+      const snapshot = await loadForDocumentCreation(socket, workspaceId, workspaceId);
+      if (typeof snapshot.missing !== "string") {
+        throw new Error(`Workspace metadata document ${workspaceId} was not found.`);
+      }
+      const workspaceDoc = new Y.Doc();
+      Y.applyUpdate(workspaceDoc, Buffer.from(snapshot.missing, "base64"));
+      if (getWorkspacePageEntries(workspaceDoc.getMap("meta")).some(page => page.id === docId)) {
+        return;
+      }
+    }
+
+    const updateBase64 = metadataUpdateBase64 ?? await buildWorkspacePageMetadataUpdate(
+      socket,
+      workspaceId,
+      docId,
+      title,
+    );
+    if (!updateBase64) return;
+    await pushForDocumentCreation(socket, workspaceId, workspaceId, updateBase64);
+  }
+
+  /**
+   * Reconcile one failed creation with the generated id. At most one identical
+   * content retry and one deduplicated metadata retry are attempted; callers
+   * must inspect the returned docId instead of starting a new creation.
+   */
+  async function reconcileDocumentCreation(
+    socket: any,
+    input: {
+      workspaceId: string;
+      docId: string;
+      title: string;
+      contentUpdateBase64: string;
+      metadataUpdateBase64?: string;
+      stage: DocumentCreationErrorInput["stage"];
+      cause: unknown;
+    },
+  ): Promise<void> {
+    let lastError = input.cause;
+    let state = await probeDocumentCreation(socket, input.workspaceId, input.docId);
+    if (state.contentPersisted === true && state.metadataPersisted === true) {
+      return;
+    }
+
+    if (
+      input.stage === "content"
+      && state.contentPersisted === false
+    ) {
+      try {
+        await pushForDocumentCreation(
+          socket,
+          input.workspaceId,
+          input.docId,
+          input.contentUpdateBase64,
+        );
+      } catch (error) {
+        lastError = error;
+      }
+      state = await probeDocumentCreation(socket, input.workspaceId, input.docId);
+    }
+
+    if (state.contentPersisted === true && state.metadataPersisted === false) {
+      try {
+        // ensureWorkspacePageMetadata reloads and checks docId before writing,
+        // so an ACK lost after the write cannot create a duplicate page entry.
+        await ensureWorkspacePageMetadata(
+          socket,
+          input.workspaceId,
+          input.docId,
+          input.title,
+          input.metadataUpdateBase64,
+        );
+      } catch (error) {
+        lastError = error;
+      }
+      state = await probeDocumentCreation(socket, input.workspaceId, input.docId);
+    }
+
+    if (state.contentPersisted === true && state.metadataPersisted === true) {
+      return;
+    }
+
+    const failureInput: DocumentCreationErrorInput = {
+      workspaceId: input.workspaceId,
+      docId: input.docId,
+      title: input.title,
+      stage: state.contentPersisted === true ? "metadata" : input.stage,
+      contentPersisted: state.contentPersisted,
+      metadataPersisted: state.metadataPersisted,
+      cause: lastError,
+    };
+    throw new DocumentCreationError(failureInput);
+  }
+
+  async function commitNewDocument(
+    socket: any,
+    workspaceId: string,
+    docId: string,
+    title: string,
+    doc: Y.Doc,
+  ): Promise<void> {
+    const contentUpdateBase64 = Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64");
+    try {
+      await pushForDocumentCreation(socket, workspaceId, docId, contentUpdateBase64);
+    } catch (error) {
+      await reconcileDocumentCreation(socket, {
+        workspaceId,
+        docId,
+        title,
+        contentUpdateBase64,
+        stage: "content",
+        cause: error,
+      });
+      return;
+    }
+
+    let metadataUpdateBase64: string | undefined;
+    try {
+      metadataUpdateBase64 = (await buildWorkspacePageMetadataUpdate(
+        socket,
+        workspaceId,
+        docId,
+        title,
+      )) ?? undefined;
+      if (metadataUpdateBase64) {
+        await pushForDocumentCreation(socket, workspaceId, workspaceId, metadataUpdateBase64);
+      }
+    } catch (error) {
+      await reconcileDocumentCreation(socket, {
+        workspaceId,
+        docId,
+        title,
+        contentUpdateBase64,
+        metadataUpdateBase64,
+        stage: "metadata",
+        cause: error,
+      });
+    }
   }
 
   async function createSemanticPageInternal(parsed: SemanticPageInput): Promise<{
@@ -4586,16 +5061,16 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    const socket = await connectForDocumentCreation(wsUrl, cookie, bearer);
 
     try {
-      await joinWorkspace(socket, workspaceId);
+      await joinForDocumentCreation(socket, workspaceId);
 
       const docId = generateId();
       const title = parsed.title || "Untitled";
       const pageType = parsed.pageType ?? "wiki_page";
       const sections = normalizeSemanticSections(pageType, parsed.sections);
-      const docShell = createDocSkeleton(title, docId);
+      const docShell = createDocSkeleton(title);
       const { blockIds, headingIds } = appendNativeBlocks(
         docShell.blocks,
         docShell.noteId,
@@ -4617,8 +5092,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
             pageId: docId,
           });
           parentLinked = true;
-        } catch {
-          warnings.push(`Semantic page created but could not be linked to parent doc "${parsed.parentDocId}". Link it manually.`);
+        } catch (error) {
+          warnings.push(parentLinkWarningOrThrow(
+            error,
+            `Semantic page created but could not be linked to parent doc "${parsed.parentDocId}". Link it manually.`,
+          ));
         }
       }
 
@@ -4687,7 +5165,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       );
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       return {
         workspaceId,
@@ -4826,9 +5304,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           })
         : [];
 
-      const visibleEdges = deletedDocIds.size > 0
-        ? mergedEdges.filter((edge: any) => !deletedDocIds.has(edge?.node?.id))
-        : mergedEdges;
+      const filteredConnection = docs?.pageInfo
+        ? filterWorkspaceListDocsConnection({
+            totalCount: typeof docs.totalCount === "number" ? docs.totalCount : 0,
+            pageInfo: docs.pageInfo,
+            edges: mergedEdges,
+          }, deletedDocIds)
+        : null;
+      const visibleEdges = filteredConnection?.edges ?? mergedEdges;
 
       const correctedTotalCount =
         typeof docs?.totalCount === "number" &&
@@ -4843,12 +5326,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const correctedPageInfo = docs?.pageInfo
         ? {
-            ...docs.pageInfo,
-            endCursor: visibleEdges.length > 0 ? visibleEdges[visibleEdges.length - 1]?.cursor ?? null : null,
-            hasNextPage:
-              typeof correctedTotalCount === "number" && !parsed.after
-                ? (parsed.offset ?? 0) + visibleEdges.length < correctedTotalCount
-                : docs.pageInfo.hasNextPage,
+            ...(filteredConnection?.pageInfo ?? docs.pageInfo),
           }
         : docs?.pageInfo;
 
@@ -4888,12 +5366,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-      if (!snapshot.missing) {
-        return text({ workspaceId, totalTags: 0, tags: [] });
-      }
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, snapshot);
 
       const wsDoc = new Y.Doc();
-      Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
       const meta = wsDoc.getMap("meta");
       const pages = getWorkspacePageEntries(meta);
       const { options, byId } = getWorkspaceTagOptionMaps(meta);
@@ -4967,12 +5443,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     tag?: string;
     sortBy?: "relevance" | "updatedAt";
     sortDirection?: "asc" | "desc";
+    offset?: number;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required.");
     const q = (parsed.query ?? "").toLocaleLowerCase().trim();
     if (!q) throw new Error("query is required.");
     const limit = parsed.limit ?? 20;
+    const offset = parsed.offset ?? 0;
     const matchMode = parsed.matchMode ?? "substring";
     const sortBy = parsed.sortBy ?? "relevance";
     const sortDirection = parsed.sortDirection ?? "desc";
@@ -4984,16 +5462,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-      if (!snapshot.missing) {
-        return text({ query: q, results: [], totalCount: 0 });
-      }
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, snapshot);
       const wsDoc = new Y.Doc();
-      Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
       const meta = wsDoc.getMap("meta");
       const pages = getWorkspacePageEntries(meta);
       const { byId } = getWorkspaceTagOptionMaps(meta);
 
-      const baseUrl = (process.env.AFFINE_BASE_URL || endpoint.replace(/\/graphql\/?$/, '')).replace(/\/$/, '');
+      const baseUrl = affineBaseUrl(endpoint, gql.baseUrl);
       const filtered = pages
         .map((page) => {
           const rank = getSearchMatchRank(page.title, q, matchMode);
@@ -5029,12 +5505,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         } else if (a.updatedTimestamp !== b.updatedTimestamp) {
           return b.updatedTimestamp - a.updatedTimestamp;
         }
-        return (a.title ?? "").localeCompare(b.title ?? "");
+        const titleOrder = (a.title ?? "").localeCompare(b.title ?? "");
+        return titleOrder !== 0 ? titleOrder : a.docId.localeCompare(b.docId);
       });
 
       const totalCount = filtered.length;
       const matches = filtered
-        .slice(0, limit)
+        .slice(offset, offset + limit)
         .map((entry) => ({
           docId: entry.docId,
           title: entry.title,
@@ -5043,6 +5520,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           url: entry.url,
           inTrash: entry.inTrash,
         }));
+      const hasMore = offset + matches.length < totalCount;
 
       return text({
         query: parsed.query,
@@ -5050,8 +5528,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         matchMode,
         sortBy,
         sortDirection,
+        limit,
         totalCount,
         results: matches,
+        offset,
+        hasMore,
+        truncated: hasMore,
+        nextOffset: hasMore ? offset + matches.length : null,
       });
     } finally {
       socket.disconnect();
@@ -5062,11 +5545,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "search_docs",
     {
       title: "Search Documents by Title",
-      description: "Fast search for documents by title using workspace metadata. Much faster than exporting each doc. Returns docId, title, direct URL, and inTrash for each match.",
+      description: "Fast search for documents by title using workspace metadata. Much faster than exporting each doc. Returns docId, title, direct URL, and inTrash for each match, plus offset/limit pagination state (hasMore, truncated, and nextOffset).",
       inputSchema: {
         workspaceId: z.string().optional().describe("Workspace ID (optional if default set)."),
         query: z.string().describe("Search query — matched case-insensitively against doc titles."),
         limit: BoundedSearchLimit.optional().describe("Max results to return (default: 20, maximum: 200)."),
+        offset: BoundedOffset.optional().describe("Zero-based result offset for paging through matches (default: 0)."),
         matchMode: z.enum(["substring", "prefix", "exact"]).optional().describe("How to match titles (default: substring)."),
         tag: z.string().optional().describe("Optional tag filter (case-insensitive substring match against resolved tag names)."),
         sortBy: z.enum(["relevance", "updatedAt"]).optional().describe("Sort by match relevance (default) or by updatedAt."),
@@ -5100,17 +5584,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-      if (!snapshot.missing) {
-        return text({
-          query: title,
-          caseInsensitive,
-          matches: [],
-          workspaceDocCount: 0,
-          truncated: false,
-        });
-      }
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, snapshot);
       const wsDoc = new Y.Doc();
-      Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
       const meta = wsDoc.getMap("meta");
       const pages = getWorkspacePageEntries(meta);
 
@@ -5199,12 +5675,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-      if (!snapshot.missing) {
-        return text({ workspaceId, tag, ignoreCase, totalDocs: 0, docs: [] });
-      }
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, snapshot);
 
       const wsDoc = new Y.Doc();
-      Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
       const meta = wsDoc.getMap("meta");
       const pages = getWorkspacePageEntries(meta);
       const { byId } = getWorkspaceTagOptionMaps(meta);
@@ -5338,16 +5812,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       if (!docSnapshot.missing) {
         warning = `Document ${parsed.docId} snapshot not found; workspace tag map was updated only.`;
       } else {
-        const doc = new Y.Doc();
-        Y.applyUpdate(doc, Buffer.from(docSnapshot.missing, "base64"));
-        const docPrevSV = Y.encodeStateVector(doc);
-        const docMeta = doc.getMap("meta");
-        const docTags = ensureTagArray(docMeta);
-        const docSync = syncTagArrayToOption(docTags, tag, option);
-        if (docSync.changed) {
-          const docDelta = Y.encodeStateAsUpdate(doc, docPrevSV);
-          await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(docDelta).toString("base64"));
-        }
         docMetaSynced = true;
       }
 
@@ -5370,7 +5834,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "add_tag_to_doc",
     {
       title: "Add Tag To Document",
-      description: "Attach a workspace tag to a document, creating the workspace tag option if needed. This updates workspace metadata and attempts to sync the document's own metadata.",
+      description: "Attach a workspace tag to a document, creating the workspace tag option if needed. Document tags are stored in workspace metadata.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
@@ -5422,16 +5886,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       if (!docSnapshot.missing) {
         warning = `Document ${parsed.docId} snapshot not found; workspace tag map was updated only.`;
       } else {
-        const doc = new Y.Doc();
-        Y.applyUpdate(doc, Buffer.from(docSnapshot.missing, "base64"));
-        const docPrevSV = Y.encodeStateVector(doc);
-        const docMeta = doc.getMap("meta");
-        const docTags = ensureTagArray(docMeta);
-        const docTagIndexes = collectMatchingTagIndexes(docTags, tag, option, true);
-        if (deleteArrayIndexes(docTags, docTagIndexes)) {
-          const docDelta = Y.encodeStateAsUpdate(doc, docPrevSV);
-          await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(docDelta).toString("base64"));
-        }
         docMetaSynced = true;
       }
 
@@ -5469,9 +5923,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
    * references it, mirroring AFFiNE's TagStore.removeTagOption. Resolves the
    * tag by id or name (ambiguous names are rejected), removes the option from
    * meta.properties.tags.options, strips the tag id from each page's tag array,
-   * then syncs each affected document's own metadata. All workspace-root edits
-   * are applied to an in-memory Y.Doc and pushed as a single delta, so a failed
-   * push leaves the server unchanged and the operation safely retriable.
+   * then leaves the updated workspace page metadata as the canonical document
+   * tag state. All workspace-root edits are applied to an in-memory Y.Doc and
+   * pushed as a single delta, so a failed push leaves the server unchanged and
+   * the operation safely retriable.
    */
   const deleteTagHandler = async (parsed: { workspaceId?: string; tag: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -5533,38 +5988,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(wsDelta).toString("base64"));
       }
 
-      // Step 3: mirror the cleanup in each affected document's own metadata.
-      let docMetaSynced = 0;
+      // Step 3: workspace page metadata is the canonical document tag state.
+      const docMetaSynced = affectedDocIds.length;
       const warnings: string[] = [];
-      // The workspace registry is the source of truth and has already been
-      // updated; per-document metadata is a secondary sync. Treat each doc as
-      // best-effort so one failing push degrades to a warning instead of
-      // throwing and leaving a non-retriable partial state.
-      for (const docId of affectedDocIds) {
-        try {
-          const docSnapshot = await loadDoc(socket, workspaceId, docId);
-          if (!docSnapshot.missing) {
-            warnings.push(`Document ${docId} snapshot not found; workspace tag map was updated only.`);
-            continue;
-          }
-          const doc = new Y.Doc();
-          Y.applyUpdate(doc, Buffer.from(docSnapshot.missing, "base64"));
-          const docPrevSV = Y.encodeStateVector(doc);
-          const docTags = getTagArray(doc.getMap("meta"));
-          if (docTags) {
-            const docIndexes = collectMatchingTagIndexes(docTags, option.id, null, false);
-            if (deleteArrayIndexes(docTags, docIndexes)) {
-              const docDelta = Y.encodeStateAsUpdate(doc, docPrevSV);
-              await pushDocUpdate(socket, workspaceId, docId, Buffer.from(docDelta).toString("base64"));
-            }
-          }
-          docMetaSynced += 1;
-        } catch (err) {
-          warnings.push(
-            `Document ${docId} metadata sync failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-      }
 
       return text({
         workspaceId,
@@ -5619,10 +6045,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   function projectReadDoc(
     doc: Y.Doc,
     docId: string,
-    options: { includeMarkdown?: boolean; tagOptionsById?: Map<string, WorkspaceTagOption> } = {},
+    options: { includeMarkdown?: boolean; tagOptionsById?: Map<string, WorkspaceTagOption>; workspaceTags?: string[] } = {},
   ): Record<string, unknown> {
-    const meta = doc.getMap("meta");
-    const tags = resolveTagLabels(getStringArray(getTagArray(meta)), options.tagOptionsById ?? new Map());
+    const tags = resolveTagLabels(getDocumentTagValues(doc, options.workspaceTags), options.tagOptionsById ?? new Map());
     const blocks = doc.getMap("blocks") as Y.Map<any>;
     const pageId = findBlockIdByFlavour(blocks, "affine:page");
     const noteId = findBlockIdByFlavour(blocks, "affine:note");
@@ -5663,7 +6088,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         type: typeof raw.get("prop:type") === "string" ? raw.get("prop:type") : null,
         text: textValue.length > 0 ? textValue : null,
         deltas: richTextValueToDeltas(propText) ?? [],
-        ...(table ? { tableData: table.tableData, tableCellDeltas: table.tableCellDeltas } : {}),
+        ...(table ? { tableData: table.tableData, tableCellDeltas: table.tableCellDeltas, tableColumnWidths: table.columnWidths } : {}),
         linkedDocIds: extractLinkedPageRefs(propText),
         checked: typeof raw.get("prop:checked") === "boolean" ? raw.get("prop:checked") : null,
         language: typeof raw.get("prop:language") === "string" ? raw.get("prop:language") : null,
@@ -5678,7 +6103,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
     let markdown: string | undefined;
     if (options.includeMarkdown) {
-      const collected = collectDocForMarkdown(doc, new Map());
+      const collected = collectDocForMarkdown(doc, new Map(), options.workspaceTags);
       markdown = renderBlocksToMarkdown({
         rootBlockIds: collected.rootBlockIds,
         blocksById: collected.blocksById,
@@ -5708,12 +6133,20 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       let tagOptionsById = new Map<string, WorkspaceTagOption>();
+      let workspaceTags: string[] | undefined;
+      let registered = false;
       const workspaceSnapshot = await loadDoc(socket, workspaceId, workspaceId);
       if (workspaceSnapshot.missing) {
         const workspaceDoc = new Y.Doc();
         try {
           Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
-          tagOptionsById = getWorkspaceTagOptionMaps(workspaceDoc.getMap("meta")).byId;
+          const workspaceMeta = workspaceDoc.getMap("meta");
+          tagOptionsById = getWorkspaceTagOptionMaps(workspaceMeta).byId;
+          const workspacePage = getWorkspacePageEntries(workspaceMeta).find(page => page.id === parsed.docId);
+          if (workspacePage) {
+            workspaceTags = getStringArray(workspacePage.tagsArray);
+          }
+          registered = isDocumentRegistered(workspaceDoc, parsed.docId);
         } finally {
           workspaceDoc.destroy();
         }
@@ -5727,6 +6160,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           title: null,
           tags: [],
           exists: false,
+          revision: null,
           blockCount: 0,
           blocks: [],
           plainText: "",
@@ -5736,7 +6170,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const doc = new Y.Doc();
       try {
         Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-        return text(projectReadDoc(doc, parsed.docId, { includeMarkdown: parsed.includeMarkdown, tagOptionsById }));
+        return text({ ...projectReadDoc(doc, parsed.docId, { includeMarkdown: parsed.includeMarkdown, tagOptionsById, workspaceTags }), revision: documentRevision(doc, registered) });
       } finally {
         doc.destroy();
       }
@@ -5748,7 +6182,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "read_doc",
     {
       title: "Read Document Content",
-      description: "Read document block content via WebSocket snapshot. Each block includes plain text and formatting-preserving deltas. Set includeMarkdown: true to also get rendered markdown, which can be lossy for unsupported inline attributes.",
+      description: "Read document block content and its revision via WebSocket snapshot. Pass revision as expectedRevision on a document write to reject stale edits through a shared MCP server. Each block includes plain text and formatting-preserving deltas. Set includeMarkdown: true to also get rendered markdown, which can be lossy for unsupported inline attributes.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
@@ -5763,6 +6197,16 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       server: {
         name: "affine-mcp",
         capabilityVersion: 1,
+        supportedTools: [...ALL_TOOLS],
+        effective: {
+          profile: defaults.toolSurface?.profile ?? "full",
+          enabledTools: [...(defaults.toolSurface?.enabledTools ?? ALL_TOOLS)],
+        },
+        writeCoordination: {
+          scope: "workspace",
+          boundary: "single MCP server process",
+          staleWritePrecondition: "read_doc.revision -> expectedRevision",
+        },
       },
       docs: {
         canonicalBlockTypes: [...APPEND_BLOCK_CANONICAL_TYPE_VALUES],
@@ -5825,7 +6269,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "get_capabilities",
     {
       title: "Get Capabilities",
-      description: "Return machine-readable capability flags for this MCP server, including block, database, collaboration, and export support.",
+      description: "Return machine-readable capability flags for this MCP server, including static feature support and the effective enabled tool surface.",
       inputSchema: {},
     },
     getCapabilitiesHandler as any
@@ -5843,11 +6287,17 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       let tagOptionsById = new Map<string, WorkspaceTagOption>();
+      let workspaceTags: string[] | undefined;
       const workspaceSnapshot = await loadDoc(socket, workspaceId, workspaceId);
       if (workspaceSnapshot.missing) {
         const workspaceDoc = new Y.Doc();
         Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
-        tagOptionsById = getWorkspaceTagOptionMaps(workspaceDoc.getMap("meta")).byId;
+        const workspaceMeta = workspaceDoc.getMap("meta");
+        tagOptionsById = getWorkspaceTagOptionMaps(workspaceMeta).byId;
+        const workspacePage = getWorkspacePageEntries(workspaceMeta).find(page => page.id === parsed.docId);
+        if (workspacePage) {
+          workspaceTags = getStringArray(workspacePage.tagsArray);
+        }
       }
 
       const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
@@ -5862,7 +6312,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-      const summary = summarizeDocFidelity(doc, tagOptionsById);
+      const summary = summarizeDocFidelity(doc, tagOptionsById, workspaceTags);
 
       return text({
         docId: parsed.docId,
@@ -5984,7 +6434,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       throw new Error(`Source parent ${parentDocId} still contains links to document ${docId}.`);
     }
     const delta = Y.encodeStateAsUpdate(parentDoc, prevSV);
-    await pushDocUpdate(
+    await pushPageDocUpdate(
       socket,
       workspaceId,
       parentDocId,
@@ -6002,7 +6452,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
     const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
-
     try {
       await joinWorkspace(socket, workspaceId);
       const outcome = await executeSafeDocumentMove(parsed, {
@@ -6121,63 +6570,59 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   // CREATE DOC (high-level)
+  /** Create a plain-text document and return placement metadata plus recoverable warnings. */
   const createDocHandler = async (parsed: { workspaceId?: string; title?: string; content?: string; parentDocId?: string; folderId?: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
     }
-    const created = await createDocInternal({ ...parsed, workspaceId });
-    const placement = await finalizeDocPlacement({
-      workspaceId: created.workspaceId,
-      docId: created.docId,
-      parentDocId: parsed.parentDocId,
-      context: "create_doc",
-    });
-    const warnings = mergeWarnings(created.warnings ?? [], placement.warnings);
-    let linkedFolderId: string | null = null;
-    let folderNodeId: string | null = null;
-    if (parsed.folderId) {
-      const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
-      const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-      const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
-      try {
-        await joinWorkspace(socket, created.workspaceId);
-        const link = await addOrganizeLinkToFolder(socket, created.workspaceId, {
-          folderId: parsed.folderId,
-          type: "doc",
-          targetId: created.docId,
-        });
-        linkedFolderId = link.parentId;
-        folderNodeId = link.id;
-      } catch (err: any) {
-        warnings.push(`Doc created but could not be placed in folder "${parsed.folderId}": ${err?.message ?? "unknown error"}`);
-      } finally {
-        socket.disconnect();
-      }
+    try {
+      const created = await createDocInternal({ ...parsed, workspaceId });
+      const placement = await finalizeDocPlacement({
+        workspaceId: created.workspaceId,
+        docId: created.docId,
+        parentDocId: parsed.parentDocId,
+        context: "create_doc",
+      });
+      const folderPlacement = await finalizeDocFolderPlacement({
+        workspaceId: created.workspaceId,
+        docId: created.docId,
+        folderId: parsed.folderId,
+      });
+      const warnings = mergeWarnings(
+        created.warnings ?? [],
+        placement.warnings,
+        folderPlacement.warnings,
+        createDocContentWarnings(parsed.content),
+      );
+      return receipt("doc.create", {
+        workspaceId: created.workspaceId,
+        docId: created.docId,
+        title: created.title,
+        status: warnings.length > 0 ? "created_with_warnings" : "created",
+        requiresManualRepair: warnings.length > 0,
+        parentDocId: placement.parentDocId,
+        linkedToParent: placement.linkedToParent,
+        folderId: folderPlacement.folderId,
+        folderLinked: folderPlacement.folderLinked,
+        folderNodeId: folderPlacement.folderNodeId,
+        warnings,
+      });
+    } catch (error) {
+      const failure = documentCreationToolResult(error, "doc.create");
+      if (failure) return failure;
+      throw error;
     }
-    return receipt("doc.create", {
-      workspaceId: created.workspaceId,
-      docId: created.docId,
-      title: created.title,
-      status: warnings.length > 0 ? "created_with_warnings" : "created",
-      requiresManualRepair: warnings.length > 0,
-      parentDocId: placement.parentDocId,
-      linkedToParent: placement.linkedToParent,
-      folderId: linkedFolderId,
-      folderLinked: folderNodeId !== null,
-      folderNodeId,
-      warnings,
-    });
   };
   server.registerTool(
     'create_doc',
     {
       title: 'Create Document',
-      description: 'Create a new AFFiNE document with optional content. If parentDocId is provided, the new doc is linked into the sidebar tree immediately. If folderId is provided, the doc is placed inside that folder in the sidebar.',
+      description: 'Create a new AFFiNE document with optional plain-text content stored as one paragraph. Use create_doc_from_markdown for native headings, lists, links, and code blocks. If parentDocId is provided, the new doc is linked into the sidebar tree immediately. If folderId is provided, the doc is placed inside that folder in the sidebar.',
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         title: z.string().optional().describe("Optional initial document title."),
-        content: z.string().optional().describe("Optional initial plain text or markdown-like content."),
+        content: z.string().optional().describe("Optional initial plain text stored as one paragraph. Use create_doc_from_markdown for structured Markdown."),
         parentDocId: z.string().optional().describe("Optional parent doc to link the new doc under in the sidebar."),
         folderId: z.string().optional().describe("Optional folder ID to place the doc in. Use list_organize_nodes to find folder IDs."),
       },
@@ -6199,20 +6644,26 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     parentDocId?: string;
     sections?: SemanticSectionInput[];
   }) => {
-    const created = await createSemanticPageInternal(parsed);
-    return text({
-      workspaceId: created.workspaceId,
-      docId: created.docId,
-      title: created.title,
-      pageType: created.pageType,
-      pageId: created.pageId,
-      noteId: created.noteId,
-      sectionCount: created.sectionHeadingIds.length,
-      sectionHeadingIds: created.sectionHeadingIds,
-      blockIds: created.blockIds,
-      parentLinked: created.parentLinked,
-      warnings: created.warnings,
-    });
+    try {
+      const created = await createSemanticPageInternal(parsed);
+      return text({
+        workspaceId: created.workspaceId,
+        docId: created.docId,
+        title: created.title,
+        pageType: created.pageType,
+        pageId: created.pageId,
+        noteId: created.noteId,
+        sectionCount: created.sectionHeadingIds.length,
+        sectionHeadingIds: created.sectionHeadingIds,
+        blockIds: created.blockIds,
+        parentLinked: created.parentLinked,
+        warnings: created.warnings,
+      });
+    } catch (error) {
+      const failure = documentCreationToolResult(error, "doc.create_semantic_page");
+      if (failure) return failure;
+      throw error;
+    }
   };
   server.registerTool(
     "create_semantic_page",
@@ -6350,6 +6801,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       ...(result.ownedIds ? { ownedIds: result.ownedIds } : {}),
       ...(result.missing ? { missing: result.missing } : {}),
       ...(markdownApplied ? { markdown: markdownApplied } : {}),
+      ...(result.warnings?.length ? { warnings: result.warnings } : {}),
     });
   };
   server.registerTool(
@@ -6361,7 +6813,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
         type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
-        text: RichTextInput.optional().describe("Block content as plain text or a delta array that preserves inline attributes."),
+        text: RichTextInput.optional().describe('Block content as plain text or a delta array. For LinkedPage references, set insert to one ASCII space and pass the pageId in reference attributes; visible labels are resolved by AFFiNE.'),
         url: z.string()
           .refine(isSafeUrlInput, "url must be a safe absolute URL without control characters or embedded credentials")
           .optional()
@@ -6399,7 +6851,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         rows: z.number().int().min(1).max(20).optional().describe("Table row count"),
         columns: z.number().int().min(1).max(20).optional().describe("Table column count"),
         tableData: z.array(z.array(z.string())).optional().describe("Plain-text cell contents for type='table', as rows of columns. Row count must equal `rows` and every row length must equal `columns`. Omit to create an empty table."),
-        tableCellDeltas: z.array(z.array(z.array(TextDeltaInput))).optional().describe("Rich-text deltas per cell for type='table', parallel to `tableData` as [row][column][delta]. A cell with deltas here overrides the plain text at the same position in `tableData`."),
+        tableCellDeltas: z.array(z.array(z.array(TextDeltaInput))).optional().describe('Rich-text deltas per cell for type="table", parallel to `tableData` as [row][column][delta]. A cell with deltas here overrides plain text at the same position. LinkedPage references require insert: " " and a pageId in reference attributes.'),
         latex: z.string().optional().describe("Latex expression"),
         level: z.number().int().min(1).max(6).optional().describe("Heading level for type=heading"),
         style: AppendBlockListStyle.optional().describe("List style for type=list"),
@@ -6440,11 +6892,17 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       let tagOptionsById = new Map<string, WorkspaceTagOption>();
+      let workspaceTags: string[] | undefined;
       const workspaceSnapshot = await loadDoc(socket, workspaceId, workspaceId);
       if (workspaceSnapshot.missing) {
         const wsDoc = new Y.Doc();
         Y.applyUpdate(wsDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
-        tagOptionsById = getWorkspaceTagOptionMaps(wsDoc.getMap("meta")).byId;
+        const workspaceMeta = wsDoc.getMap("meta");
+        tagOptionsById = getWorkspaceTagOptionMaps(workspaceMeta).byId;
+        const workspacePage = getWorkspacePageEntries(workspaceMeta).find(page => page.id === parsed.docId);
+        if (workspacePage) {
+          workspaceTags = getStringArray(workspacePage.tagsArray);
+        }
       }
 
       const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
@@ -6467,7 +6925,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-      const collected = collectDocForMarkdown(doc, tagOptionsById);
+      const collected = collectDocForMarkdown(doc, tagOptionsById, workspaceTags);
       const rendered = renderBlocksToMarkdown({
         rootBlockIds: collected.rootBlockIds,
         blocksById: collected.blocksById,
@@ -6529,11 +6987,17 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       let tagOptionsById = new Map<string, WorkspaceTagOption>();
+      let workspaceTags: string[] | undefined;
       const workspaceSnapshot = await loadDoc(socket, workspaceId, workspaceId);
       if (workspaceSnapshot.missing) {
         const wsDoc = new Y.Doc();
         Y.applyUpdate(wsDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
-        tagOptionsById = getWorkspaceTagOptionMaps(wsDoc.getMap("meta")).byId;
+        const workspaceMeta = wsDoc.getMap("meta");
+        tagOptionsById = getWorkspaceTagOptionMaps(workspaceMeta).byId;
+        const workspacePage = getWorkspacePageEntries(workspaceMeta).find(page => page.id === parsed.docId);
+        if (workspacePage) {
+          workspaceTags = getStringArray(workspacePage.tagsArray);
+        }
       }
 
       const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
@@ -6553,7 +7017,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-      const summary = summarizeDocFidelity(doc, tagOptionsById);
+      const summary = summarizeDocFidelity(doc, tagOptionsById, workspaceTags);
       let markdown = summary.markdown;
 
       if (parsed.includeFrontmatter) {
@@ -6600,14 +7064,17 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     exportWithFidelityReportHandler as any
   );
 
-  // Core logic for creating a doc from markdown — returns structured data, no MCP envelope.
-  // Used by createDocFromMarkdownHandler and internal markdown-based flows.
+  /**
+   * Create native Markdown blocks and report optional organize-folder placement.
+   * Return structured data for the MCP handler and internal flows, without an MCP envelope.
+   */
   const createDocFromMarkdownCore = async (parsed: {
     workspaceId?: string;
     title?: string;
     markdown: string;
     strict?: boolean;
     parentDocId?: string;
+    folderId?: string;
   }) => {
     const parsedMarkdown = parseMarkdownToOperations(parsed.markdown);
     let operations = [...parsedMarkdown.operations];
@@ -6656,9 +7123,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           strict: parsed.strict,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(
-          `Document ${created.docId} was created, but its Markdown content could not be confirmed: ${message}. Inspect or delete that document before retrying.`,
+        throw documentCreationMaterializationError(
+          {
+            workspaceId: created.workspaceId,
+            docId: created.docId,
+            title: created.title,
+          },
+          error,
         );
       }
     }
@@ -6669,21 +7140,34 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       parentDocId: parsed.parentDocId,
       context: "create_doc_from_markdown",
     });
+    const folderPlacement = await finalizeDocFolderPlacement({
+      workspaceId: created.workspaceId,
+      docId: created.docId,
+      folderId: parsed.folderId,
+    });
 
     const applyWarnings: string[] = [];
     if (applied.skippedCount > 0) {
       applyWarnings.push(`${applied.skippedCount} markdown block(s) could not be applied to AFFiNE and were skipped.`);
     }
 
-    const warnings = mergeWarnings(parsedMarkdown.warnings, applyWarnings, placement.warnings);
+    const warnings = mergeWarnings(
+      parsedMarkdown.warnings,
+      applyWarnings,
+      placement.warnings,
+      folderPlacement.warnings,
+    );
     return {
       workspaceId: created.workspaceId,
       docId: created.docId,
       title: created.title,
       status: warnings.length > 0 ? "created_with_warnings" : "created",
-      requiresManualRepair: placement.warnings.length > 0,
+      requiresManualRepair: placement.warnings.length > 0 || folderPlacement.warnings.length > 0,
       parentDocId: placement.parentDocId,
       linkedToParent: placement.linkedToParent,
+      folderId: folderPlacement.folderId,
+      folderLinked: folderPlacement.folderLinked,
+      folderNodeId: folderPlacement.folderNodeId,
       warnings,
       lossy: MARKDOWN_IMPORT_IS_LOSSY || parsedMarkdown.lossy || applied.skippedCount > 0,
       stats: {
@@ -6696,26 +7180,35 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     };
   };
 
+  /** Wrap native Markdown creation in its MCP receipt and preserve structured failure results. */
   const createDocFromMarkdownHandler = async (parsed: {
     workspaceId?: string;
     title?: string;
     markdown: string;
     strict?: boolean;
     parentDocId?: string;
+    folderId?: string;
   }) => {
-    return receipt("doc.create_from_markdown", await createDocFromMarkdownCore(parsed));
+    try {
+      return receipt("doc.create_from_markdown", await createDocFromMarkdownCore(parsed));
+    } catch (error) {
+      const failure = documentCreationToolResult(error, "doc.create_from_markdown");
+      if (failure) return failure;
+      throw error;
+    }
   };
   server.registerTool(
     "create_doc_from_markdown",
     {
       title: "Create Document From Markdown",
-      description: "Create a new AFFiNE document and import markdown content. Use parentDocId to automatically embed the new doc into a parent, making it visible in the sidebar instead of being an orphan.",
+      description: "Create a new AFFiNE document and import Markdown as native blocks. Use parentDocId to embed the new doc into a parent, or folderId to place it in an organize folder.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         title: z.string().optional(),
         markdown: MarkdownContent.describe("Markdown content to import"),
         strict: z.boolean().optional(),
         parentDocId: z.string().optional().describe("If provided, the new doc is automatically embedded into this parent doc as a linked child (visible in sidebar)."),
+        folderId: z.string().optional().describe("Optional folder ID to place the doc in. Use list_organize_nodes to find folder IDs."),
       },
     },
     createDocFromMarkdownHandler as any
@@ -6732,14 +7225,25 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     if (!workspaceId) throw new Error("workspaceId is required.");
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    const socket = await connectForDocumentCreation(wsUrl, cookie, bearer);
     try {
-      await joinWorkspace(socket, workspaceId);
-      const snap = await loadDoc(socket, workspaceId, parsed.templateDocId);
+      await joinForDocumentCreation(socket, workspaceId);
+      const workspaceSnapshot = await loadForDocumentCreation(socket, workspaceId, workspaceId);
+      let workspaceTags: string[] | undefined;
+      if (workspaceSnapshot.missing) {
+        const workspaceDoc = new Y.Doc();
+        Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
+        const sourcePage = getWorkspacePageEntries(workspaceDoc.getMap("meta"))
+          .find(page => page.id === parsed.templateDocId);
+        if (sourcePage) {
+          workspaceTags = getStringArray(sourcePage.tagsArray);
+        }
+      }
+      const snap = await loadForDocumentCreation(socket, workspaceId, parsed.templateDocId);
       if (!snap.missing) throw new Error(`Template doc ${parsed.templateDocId} not found.`);
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
-      const collected = collectDocForMarkdown(doc, new Map());
+      const collected = collectDocForMarkdown(doc, new Map(), workspaceTags);
       const rendered = renderBlocksToMarkdown({ rootBlockIds: collected.rootBlockIds, blocksById: collected.blocksById });
       let markdown = rendered.markdown;
       const vars = parsed.variables ?? {};
@@ -7000,9 +7504,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       const wsSnap = await loadDoc(socket, workspaceId, workspaceId);
-      if (!wsSnap.missing) return text({ workspaceId, tree: [] });
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, wsSnap);
       const wsDoc = new Y.Doc();
-      Y.applyUpdate(wsDoc, Buffer.from(wsSnap.missing, "base64"));
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
       const pages = getWorkspacePageEntries(wsDoc.getMap("meta"));
       const titleById = new Map(pages.map(p => [p.id, p.title ?? "Untitled"]));
       const trashById = new Map(pages.map(p => [p.id, p.inTrash]));
@@ -7023,7 +7527,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         }
         if (kids.length) childrenOf.set(page.id, kids);
       }
-      const baseUrl = (process.env.AFFINE_BASE_URL || endpoint.replace(/\/graphql\/?$/, '')).replace(/\/$/, '');
+      const baseUrl = affineBaseUrl(endpoint, gql.baseUrl);
       const roots = pages.filter(p => !allChildren.has(p.id)).map(p => p.id);
       const buildNode = (id: string, depth: number): any => ({
         docId: id, title: titleById.get(id) ?? "Untitled",
@@ -7053,9 +7557,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     try {
       await joinWorkspace(socket, workspaceId);
       const wsSnap = await loadDoc(socket, workspaceId, workspaceId);
-      if (!wsSnap.missing) return text({ orphans: [] });
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, wsSnap);
       const wsDoc = new Y.Doc();
-      Y.applyUpdate(wsDoc, Buffer.from(wsSnap.missing, "base64"));
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
       const pages = getWorkspacePageEntries(wsDoc.getMap("meta"));
       const titleById = new Map(pages.map(p => [p.id, p.title ?? "Untitled"]));
       const allChildren = new Set<string>();
@@ -7069,7 +7573,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           allChildren.add(pageId);
         }
       }
-      const baseUrl = (process.env.AFFINE_BASE_URL || endpoint.replace(/\/graphql\/?$/, "")).replace(/\/$/, "");
+      const baseUrl = affineBaseUrl(endpoint, gql.baseUrl);
       const orphans = pages
         .filter(p => !allChildren.has(p.id))
         .map(p => ({
@@ -7098,17 +7602,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const titleById = new Map<string, string>();
       const trashById = new Map<string, boolean>();
       const workspacePageIds = new Set<string>();
-      let hasWorkspaceMetadata = false;
       const wsSnap = await loadDoc(socket, workspaceId, workspaceId);
-      if (wsSnap.missing) {
-        hasWorkspaceMetadata = true;
-        const wsDoc = new Y.Doc();
-        Y.applyUpdate(wsDoc, Buffer.from(wsSnap.missing, "base64"));
-        for (const page of getWorkspacePageEntries(wsDoc.getMap("meta"))) {
-          workspacePageIds.add(page.id);
-          trashById.set(page.id, page.inTrash);
-          if (page.title) titleById.set(page.id, page.title);
-        }
+      const workspaceRoot = requireWorkspaceRootSnapshot(workspaceId, wsSnap);
+      const wsDoc = new Y.Doc();
+      Y.applyUpdate(wsDoc, Buffer.from(workspaceRoot, "base64"));
+      for (const page of getWorkspacePageEntries(wsDoc.getMap("meta"))) {
+        workspacePageIds.add(page.id);
+        trashById.set(page.id, page.inTrash);
+        if (page.title) titleById.set(page.id, page.title);
       }
       const snap = await loadDoc(socket, workspaceId, parsed.docId);
       if (!snap.missing) return text({ docId: parsed.docId, children: [] });
@@ -7118,11 +7619,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const children: Array<{ docId: string; title: string | null; url: string; inTrash: boolean }> = [];
       const seen = new Set<string>();
       for (const pageId of collectLinkedChildIds(blocks)) {
-        if (hasWorkspaceMetadata && !workspacePageIds.has(pageId)) continue;
+        if (!workspacePageIds.has(pageId)) continue;
         if (seen.has(pageId)) continue;
         seen.add(pageId);
         children.push({ docId: pageId, title: titleById.get(pageId) ?? null,
-          url: `${(process.env.AFFINE_BASE_URL || endpoint.replace(/\/graphql\/?$/, '')).replace(/\/$/, '')}/workspace/${workspaceId}/${pageId}`,
+          url: `${affineBaseUrl(endpoint, gql.baseUrl)}/workspace/${workspaceId}/${pageId}`,
           inTrash: trashById.get(pageId) ?? false });
       }
       return text({ docId: parsed.docId, count: children.length, children });
@@ -7174,7 +7675,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           }
         }
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
-        await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+        await pushPageDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
       }
       return receipt("doc.update_title", {
         workspaceId,
@@ -7194,7 +7695,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
   }, updateDocTitleHandler as any);
 
-  async function syncRawTagsToDoc(parsed: {
+  async function syncRawTagsToWorkspacePage(parsed: {
     workspaceId: string;
     docId: string;
     tags: string[];
@@ -7231,24 +7732,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const wsDelta = Y.encodeStateAsUpdate(wsDoc, wsPrevSV);
       await pushDocUpdate(socket, parsed.workspaceId, parsed.workspaceId, Buffer.from(wsDelta).toString("base64"));
-
-      const docSnapshot = await loadDoc(socket, parsed.workspaceId, parsed.docId);
-      if (!docSnapshot.missing) {
-        throw new Error(`Document ${parsed.docId} not found in workspace ${parsed.workspaceId}`);
-      }
-
-      const doc = new Y.Doc();
-      Y.applyUpdate(doc, Buffer.from(docSnapshot.missing, "base64"));
-      const docPrevSV = Y.encodeStateVector(doc);
-      const docMeta = doc.getMap("meta");
-      const docTags = ensureTagArray(docMeta);
-      docTags.delete(0, docTags.length);
-      for (const tag of parsed.tags) {
-        docTags.push([tag]);
-      }
-
-      const docDelta = Y.encodeStateAsUpdate(doc, docPrevSV);
-      await pushDocUpdate(socket, parsed.workspaceId, parsed.docId, Buffer.from(docDelta).toString("base64"));
     } finally {
       socket.disconnect();
     }
@@ -7272,7 +7755,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
       const workspaceDoc = new Y.Doc();
       Y.applyUpdate(workspaceDoc, Buffer.from(workspaceSnapshot.missing, "base64"));
-      const tagOptionsById = getWorkspaceTagOptionMaps(workspaceDoc.getMap("meta")).byId;
+      const workspaceMeta = workspaceDoc.getMap("meta");
+      const tagOptionsById = getWorkspaceTagOptionMaps(workspaceMeta).byId;
+      const sourcePage = getWorkspacePageEntries(workspaceMeta).find(page => page.id === parsed.templateDocId);
+      if (!sourcePage) {
+        throw new Error(`Template doc ${parsed.templateDocId} was not found in workspace ${workspaceId}.`);
+      }
 
       const templateSnapshot = await loadDoc(socket, workspaceId, parsed.templateDocId);
       if (!templateSnapshot.missing) {
@@ -7281,11 +7769,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const templateDoc = new Y.Doc();
       Y.applyUpdate(templateDoc, Buffer.from(templateSnapshot.missing, "base64"));
-      const meta = templateDoc.getMap("meta");
-      const rawTags = getStringArray(getTagArray(meta));
+      const rawTags = getStringArray(sourcePage.tagsArray);
       const resolvedTags = resolveTagLabels(rawTags, tagOptionsById);
       const supportIssues: NativeTemplateSupportIssue[] = [];
-      scanNativeTemplateValue(meta, "meta", supportIssues, new WeakSet<object>());
       scanNativeTemplateValue(templateDoc.getMap("blocks"), "blocks", supportIssues, new WeakSet<object>());
 
       return text(summarizeNativeTemplateStructure(
@@ -7331,6 +7817,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
     const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    let createdDocForRecovery: Pick<CreateDocResult, "workspaceId" | "docId" | "title"> | null = null;
 
     try {
       await joinWorkspace(socket, workspaceId);
@@ -7355,12 +7842,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const templateDoc = new Y.Doc();
       Y.applyUpdate(templateDoc, Buffer.from(templateSnapshot.missing, "base64"));
-      const templateMeta = templateDoc.getMap("meta");
       const templateBlocks = templateDoc.getMap("blocks") as Y.Map<any>;
       const rawTags = getStringArray(sourcePage.tagsArray);
       const resolvedTags = resolveTagLabels(rawTags, tagOptionById);
       const supportIssues: NativeTemplateSupportIssue[] = [];
-      scanNativeTemplateValue(templateMeta, "meta", supportIssues, new WeakSet<object>());
       scanNativeTemplateValue(templateBlocks, "blocks", supportIssues, new WeakSet<object>());
       const nativeSummary = summarizeNativeTemplateStructure(
         templateDoc,
@@ -7401,6 +7886,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         workspaceId,
         title: targetTitle,
       });
+      createdDocForRecovery = created;
 
       const targetSnapshot = await loadDoc(socket, workspaceId, created.docId);
       if (!targetSnapshot.missing) {
@@ -7410,7 +7896,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const targetDoc = new Y.Doc();
       Y.applyUpdate(targetDoc, Buffer.from(targetSnapshot.missing, "base64"));
       const prevSV = Y.encodeStateVector(targetDoc);
-      const targetMeta = targetDoc.getMap("meta");
       const targetBlocks = targetDoc.getMap("blocks") as Y.Map<any>;
 
       const blockIdMap = new Map<string, string>();
@@ -7439,16 +7924,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         targetBlocks.set(nextBlockId, cloned);
       }
 
-      targetMeta.set("id", created.docId);
-      targetMeta.set("title", targetTitle);
-      if (preserveTags) {
-        const targetMetaTags = ensureTagArray(targetMeta);
-        targetMetaTags.delete(0, targetMetaTags.length);
-        for (const tag of rawTags) {
-          targetMetaTags.push([tag]);
-        }
-      }
-
       const pageId = findBlockIdByFlavour(targetBlocks, "affine:page");
       if (pageId) {
         const pageBlock = findBlockById(targetBlocks, pageId);
@@ -7458,10 +7933,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(targetDoc, prevSV);
-      await pushDocUpdate(socket, workspaceId, created.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(socket, workspaceId, created.docId, Buffer.from(delta).toString("base64"));
 
       if (preserveTags && rawTags.length > 0) {
-        await syncRawTagsToDoc({
+        await syncRawTagsToWorkspacePage({
           workspaceId,
           docId: created.docId,
           tags: rawTags,
@@ -7499,6 +7974,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         blockCount: nativeSummary.blockCount,
         rootBlockIds: nativeSummary.rootBlockIds.map(blockId => blockIdMap.get(blockId) ?? blockId),
       });
+    } catch (error) {
+      const creationError = createdDocForRecovery
+        ? documentCreationMaterializationError(createdDocForRecovery, error)
+        : error;
+      const failure = documentCreationToolResult(creationError, "doc.instantiate_template_native");
+      if (failure) return failure;
+      throw error;
     } finally {
       socket.disconnect();
     }
@@ -8196,7 +8678,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
-      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       return text({
         added: true,
@@ -8218,7 +8700,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
         docId: DocId.describe("Document ID containing the database"),
         databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
-        cells: z.record(z.unknown()).describe("Map of column name (or column ID) to cell value. Rich-text and title values accept strings or delta arrays with optional attributes. For select columns, pass the display label (option auto-created if new)."),
+        cells: z.record(z.unknown()).describe('Map of column name (or column ID) to cell value. Rich-text and title values accept strings or delta arrays. For LinkedPage references, use insert: " " with reference.type="LinkedPage" and the target pageId; visible labels are resolved by AFFiNE. For select columns, pass the display label (option auto-created if new).'),
         linkedDocId: z.string().optional().describe("Link this row to an existing doc by ID. The row will open the linked doc in center peek when clicked."),
       },
     },
@@ -8250,7 +8732,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
-      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       return text({
         deleted: true,
@@ -8438,7 +8920,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
-      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       return text({
         updated: true,
@@ -8459,7 +8941,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         docId: DocId.describe("Document ID containing the database"),
         databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
         rowBlockId: z.string().min(1).describe("Row paragraph block ID"),
-        cells: z.record(z.unknown()).describe("Map of column name (or column ID) to new cell value. Rich-text and title values accept strings or delta arrays with optional attributes. Use `title` for the built-in row title."),
+        cells: z.record(z.unknown()).describe('Map of column name (or column ID) to new cell value. Rich-text and title values accept strings or delta arrays. For LinkedPage references, use insert: " " with reference.type="LinkedPage" and the target pageId; visible labels are resolved by AFFiNE. Use `title` for the built-in row title.'),
         createOption: z.boolean().optional().describe("For select and multi-select columns, create the option label if it does not exist (default true)"),
         linkedDocId: z.string().optional().describe("Link this row to an existing doc by ID. The row will open the linked doc in center peek when clicked."),
       },
@@ -8530,7 +9012,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
-      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       const finalLookup = buildDatabaseColumnLookup(readColumnDefs(ctx.dbBlock));
       const finalViews = readDatabaseViewDefs(ctx.dbBlock, finalLookup);
@@ -8729,7 +9211,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushPageDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
 
       return text({
         added: true,
@@ -9195,7 +9677,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
       writeSurfaceElement(ctx.value, elementId, data);
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(
+      await pushPageDocUpdate(
         socket,
         workspaceId,
         params.docId,
@@ -9433,7 +9915,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       if (changed.length > 0) {
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
-        await pushDocUpdate(
+        await pushPageDocUpdate(
           socket,
           workspaceId,
           params.docId,
@@ -9518,7 +10000,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       pruneFromFrameChildElementIds(blocks, [params.elementId, ...prunedConnectors]);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(
+      await pushPageDocUpdate(
         socket,
         workspaceId,
         params.docId,
@@ -9599,7 +10081,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(
+      await pushPageDocUpdate(
         socket,
         workspaceId,
         params.docId,
@@ -9693,7 +10175,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       if (changed.length > 0) {
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
-        await pushDocUpdate(
+        await pushPageDocUpdate(
           socket,
           workspaceId,
           params.docId,
@@ -9825,7 +10307,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       if (changed.length > 0) {
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
-        await pushDocUpdate(
+        await pushPageDocUpdate(
           socket,
           workspaceId,
           params.docId,
@@ -9912,7 +10394,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       if (changed) {
         writeTableCellText(block, rowId, columnId, nextText);
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
-        await pushDocUpdate(
+        await pushPageDocUpdate(
           socket,
           workspaceId,
           params.docId,
@@ -9934,6 +10416,96 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         cell: {
           text: changed ? richTextValueToString(nextText) : previousText,
           deltas: changed ? nextDeltas : previousDeltas,
+        },
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  /** Apply an ordered width snapshot to an existing native AFFiNE table. */
+  const updateTableColumnWidthsHandler = async (
+    params: UpdateTableColumnWidthsInput,
+  ) => {
+    const workspaceId = params.workspaceId || defaults.workspaceId;
+    if (!workspaceId) {
+      throw new Error(
+        "workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment."
+      );
+    }
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, params.docId);
+      if (!snapshot.missing) {
+        throw new Error(`Document '${params.docId}' not found or has no content.`);
+      }
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const block = findBlockById(blocks, params.blockId);
+      if (!block) {
+        throw new Error(`Block '${params.blockId}' not found.`);
+      }
+      const flavour = block.get("sys:flavour");
+      if (flavour !== "affine:table") {
+        throw new Error(
+          `Block '${params.blockId}' has flavour '${String(flavour)}' — update_table_column_widths only mutates affine:table blocks.`
+        );
+      }
+
+      const table = extractTableData(block);
+      if (!table) {
+        throw new Error(`Table block '${params.blockId}' has no readable row/column layout.`);
+      }
+      if (params.widths.length !== table.columnIds.length) {
+        throw new Error(
+          `widths length must match table column count (${table.columnIds.length}).`
+        );
+      }
+
+      const changedColumns: Array<{
+        column: number;
+        columnId: string;
+        previousWidth: number | null;
+        width: number | null;
+      }> = [];
+      params.widths.forEach((width, column) => {
+        const previousWidth = table.columnWidths[column];
+        if (previousWidth === width) return;
+        const columnId = table.columnIds[column];
+        writeTableColumnWidth(block, columnId, width);
+        changedColumns.push({ column, columnId, previousWidth, width });
+      });
+
+      if (changedColumns.length > 0) {
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushPageDocUpdate(
+          socket,
+          workspaceId,
+          params.docId,
+          Buffer.from(delta).toString("base64")
+        );
+      }
+
+      return text({
+        updated: changedColumns.length > 0,
+        blockId: params.blockId,
+        rowCount: table.rowIds.length,
+        columnCount: table.columnIds.length,
+        columnIds: table.columnIds,
+        changedColumns,
+        previous: {
+          widths: table.columnWidths,
+          totalWidth: totalTableColumnWidth(table.columnWidths),
+        },
+        table: {
+          widths: params.widths,
+          totalWidth: totalTableColumnWidth(params.widths),
         },
       });
     } finally {
@@ -10022,7 +10594,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       block.set("sys:parent", null);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(
+      await pushPageDocUpdate(
         socket,
         workspaceId,
         params.docId,
@@ -10150,7 +10722,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const result = deleteBlockInDoc(doc, params);
       if (result.deleted) {
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
-        await pushDocUpdate(socket, workspaceId, params.docId, Buffer.from(delta).toString("base64"));
+        await pushPageDocUpdate(socket, workspaceId, params.docId, Buffer.from(delta).toString("base64"));
       }
       return text(result);
     } finally {
@@ -10163,6 +10735,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
     try {
       await joinWorkspace(socket, workspaceId);
+      const rootSnapshot = await loadDoc(socket, workspaceId, workspaceId);
+      if (!rootSnapshot.missing) throw new DocPatchError("PATCH_WORKSPACE_UNAVAILABLE", "Workspace root is unavailable.");
+      const root = new Y.Doc();
+      try {
+        Y.applyUpdate(root, Buffer.from(rootSnapshot.missing, "base64"));
+        if (!isDocumentRegistered(root, docId)) return null;
+      } finally { root.destroy(); }
       const snapshot = await loadDoc(socket, workspaceId, docId);
       return snapshot.missing ? new Uint8Array(Buffer.from(snapshot.missing, "base64")) : null;
     } finally {
@@ -10175,7 +10754,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
     try {
       await joinWorkspace(socket, workspaceId);
-      await pushDocUpdate(socket, workspaceId, docId, Buffer.from(update).toString("base64"));
+      await pushPageDocUpdate(socket, workspaceId, docId, Buffer.from(update).toString("base64"));
     } finally {
       socket.disconnect();
     }
@@ -10192,6 +10771,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     return createDocPatchManager({
       store: patchStore,
       scope,
+      coordinateApply: (workspaceId, operation, signal) => writeCoordinator.run(
+        JSON.stringify([new URL(auth.endpoint).origin, workspaceId]), operation, signal,
+      ),
       loadCurrent: (workspaceId, docId) => loadCurrentDocBytes(workspaceId, docId, auth),
       pushUpdate: (workspaceId, docId, update) => pushPreparedDocBytes(workspaceId, docId, update, auth),
       ...patchOptions.backend,
@@ -10279,12 +10861,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   }
 
   function patchFailure(error: unknown, patchId?: string) {
-    const patchError = error instanceof DocPatchError ? error : null;
+    const patchError = error instanceof DocPatchError || error instanceof WriteCoordinatorError ? error : null;
     return toolError(error, {
       code: patchError?.code ?? "PATCH_FAILED",
       retryable: patchError?.retryable ?? false,
       data: patchId ? { patchId } : undefined,
-      details: patchError?.details,
+      details: error instanceof DocPatchError ? error.details : undefined,
     });
   }
 
@@ -10305,11 +10887,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   };
 
-  const applyDocPatchHandler = async (raw: unknown) => {
+  const applyDocPatchHandler = async (raw: unknown, extra?: { signal?: AbortSignal }) => {
     const parsed = ApplyDocPatchInput.parse(raw);
     try {
       const docPatches = await getDocPatchManager();
-      return text(await docPatches.apply(parsed.patchId));
+      return text(await docPatches.apply(parsed.patchId, extra?.signal));
     } catch (error) {
       return patchFailure(error, parsed.patchId);
     }
@@ -10744,7 +11326,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
         blockId: z.string().min(1).describe("Block id to update."),
-        text: RichTextInput.optional().describe("Replacement block text. A delta array preserves inline attributes. Omit to preserve the current text."),
+        text: RichTextInput.optional().describe('Replacement block text. Delta arrays preserve inline attributes. For LinkedPage references, set insert to one ASCII space and pass the pageId in reference attributes; visible labels are resolved by AFFiNE. Omit to preserve the current text.'),
         checked: z.boolean().optional().describe("Todo checked state. Only valid for a list whose resulting style is todo."),
         type: BlockEditType.optional().describe("Resulting logical block type."),
         style: AppendBlockListStyle.optional().describe("Resulting list style. Only valid for list blocks."),
@@ -10766,10 +11348,33 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         blockId: z.string().min(1).describe("Table block id (flavour affine:table)."),
         row: z.number().int().min(0).describe("Zero-based table row."),
         column: z.number().int().min(0).describe("Zero-based table column."),
-        text: RichTextInput.describe("Replacement cell text as plain text or a delta array that preserves inline attributes."),
+        text: RichTextInput.describe('Replacement cell text as plain text or a delta array. For LinkedPage references, set insert to one ASCII space and pass the pageId in reference attributes; visible labels are resolved by AFFiNE.'),
       },
     },
     updateTableCellHandler as any
+  );
+
+  server.registerTool(
+    "update_table_column_widths",
+    {
+      title: "Update Table Column Widths",
+      description:
+        "Set every column width in an AFFiNE table while preserving rows and cell content. Pass null for a column to restore AFFiNE's automatic width.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        docId: DocId,
+        blockId: z.string().min(1).describe("Table block id (flavour affine:table)."),
+        widths: z.array(
+          z.union([
+            z.number().finite().min(TABLE_COLUMN_MIN_WIDTH).max(TABLE_COLUMN_MAX_WIDTH),
+            z.null(),
+          ])
+        ).min(1).describe(
+          "Widths in pixels, in current column order. Provide exactly one entry per column; null restores automatic width."
+        ),
+      },
+    },
+    updateTableColumnWidthsHandler as any
   );
 
   server.registerTool(
